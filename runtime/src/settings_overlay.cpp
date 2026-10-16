@@ -375,11 +375,16 @@ void DrawWiiRemoteSettings(uint32_t selectedGamePort) {
     }
     ImGui::Separator();
 
-    const WiiRemoteInput::Kind kind = WiiRemoteInput::KindForPort(selectedGamePort);
-    ImGui::Text("Port %u: %s", static_cast<unsigned>(selectedGamePort + 1), WiiRemoteInput::KindLabel(kind));
-    if (kind == WiiRemoteInput::Kind::RemoteWithClassic) {
+    // A GC port shows the remote on its own player index, a Wii slot whatever serves its channel.
+    const bool wiiChannel = selectedGamePort >= PAD_MAX_CONTROLLERS;
+    const uint32_t chan = wiiChannel ? selectedGamePort - PAD_MAX_CONTROLLERS : selectedGamePort;
+    const WiiRemoteInput::Kind kind =
+        wiiChannel ? WiiRemoteInput::EffectiveKind(chan) : WiiRemoteInput::KindForPort(selectedGamePort);
+    ImGui::Text("%s %u: %s", wiiChannel ? "Wii" : "GC", static_cast<unsigned>(chan + 1),
+                WiiRemoteInput::KindLabel(kind));
+    if (kind == WiiRemoteInput::Kind::RemoteWithClassic || kind == WiiRemoteInput::Kind::EmulatedClassic) {
         WiiRemoteInput::KpadSample sample;
-        if (WiiRemoteInput::ReadKpadSample(selectedGamePort, sample)) {
+        if (WiiRemoteInput::ReadKpadSample(chan, sample)) {
             // WPAD_CL_BUTTON_* bits, in the game's own layout (no mapping involved).
             const auto held = [&](uint32_t bit, const char* on, const char* off) { return (sample.clHold & bit) ? on : off; };
             ImGui::Text("Classic: %s %s %s %s  %s %s  %s %s  %s %s  %s %s %s %s", held(0x0010, "A", "a"),
@@ -423,7 +428,7 @@ void DrawWiiRemoteSettings(uint32_t selectedGamePort) {
     }
     if (kind == WiiRemoteInput::Kind::Remote || kind == WiiRemoteInput::Kind::RemoteWithNunchuk ||
         kind == WiiRemoteInput::Kind::RemoteWithClassic) {
-        DrawWiiRemoteAccelerometer(selectedGamePort);
+        DrawWiiRemoteAccelerometer(chan);
     }
 
     ImGui::EndMenu();
@@ -747,17 +752,21 @@ void DrawRumbleSettings() {
 }
 
 void DrawControllerSettings() {
-    for (int port = 0; port < PAD_MAX_CONTROLLERS; ++port) {
-        const std::string label = "Port " + std::to_string(port + 1);
+    // GameCube ports on the first row, Wii channels (the player indices after them) on the second.
+    for (int port = 0; port < PAD_MAX_ASSIGNABLE_PORTS; ++port) {
+        const std::string label = port < PAD_MAX_CONTROLLERS
+            ? "GC " + std::to_string(port + 1)
+            : "Wii " + std::to_string(port - PAD_MAX_CONTROLLERS + 1);
         ImGui::RadioButton(label.c_str(), &g_controllerPort, port);
-        if (port + 1 < PAD_MAX_CONTROLLERS) {
+        if (port + 1 != PAD_MAX_CONTROLLERS && port + 1 < PAD_MAX_ASSIGNABLE_PORTS) {
             ImGui::SameLine();
         }
     }
 
     ImGui::Separator();
     const uint32_t selectedGamePort = static_cast<uint32_t>(g_controllerPort);
-    if (DrawKeyboardSettings(selectedGamePort)) {
+    const bool wiiChannel = selectedGamePort >= PAD_MAX_CONTROLLERS;
+    if (!wiiChannel && DrawKeyboardSettings(selectedGamePort)) {
         return;
     }
     ImGui::Separator();
@@ -788,6 +797,11 @@ void DrawControllerSettings() {
             ImGui::PopID();
         }
         ImGui::EndMenu();
+    }
+    if (wiiChannel) {
+        ImGui::TextDisabled("A gamepad here is the channel's Classic Controller, a/b/x/y by position;");
+        ImGui::TextDisabled("button mapping, input expressions and rumble apply to GC ports.");
+        return;
     }
 
     uint32_t mappingCount = 0;

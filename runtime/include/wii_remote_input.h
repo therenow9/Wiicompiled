@@ -25,7 +25,49 @@ enum class Kind : uint8_t {
     RemoteWithNunchuk,
     RemoteWithClassic,
     WiiUPro,
+    EmulatedClassic,    // any other gamepad on a Wii channel's own player index
 };
+
+// True for the kinds the game reads through KPAD.
+inline bool IsKpadKind(Kind kind) {
+    return kind == Kind::Remote || kind == Kind::RemoteWithNunchuk || kind == Kind::RemoteWithClassic ||
+           kind == Kind::EmulatedClassic;
+}
+
+// Wii channel `chan`'s own player index is kWiiChannelIndexBase + chan, after the GameCube ports.
+constexpr uint32_t kWiiChannelIndexBase = 4;
+
+// What SDL holds at one player index.
+struct IndexContents {
+    bool present = false;
+    Kind kind = Kind::NotWii;
+};
+
+// The controller serving a Wii channel: its kind, the player index it sits at
+// (-1 for none), and whether it is there now or remembered across a swap.
+struct ChannelSource {
+    Kind kind = Kind::NotWii;
+    int index = -1;
+    bool live = false;
+};
+
+// A remote at index `chan` wins, else the pad at the channel's own index (any non-remote as an emulated
+// Classic), else `remembered` while `graceLive`, unless a pad that is not a remote took its index.
+inline ChannelSource ChooseChannelSource(uint32_t chan, IndexContents atChan, IndexContents atWiiIndex,
+                                         ChannelSource remembered, bool graceLive) {
+    if (IsKpadKind(atChan.kind)) {
+        return {atChan.kind, static_cast<int>(chan), true};
+    }
+    if (atWiiIndex.present) {
+        const Kind kind = IsKpadKind(atWiiIndex.kind) ? atWiiIndex.kind : Kind::EmulatedClassic;
+        return {kind, static_cast<int>(kWiiChannelIndexBase + chan), true};
+    }
+    const bool taken = remembered.index == static_cast<int>(chan) && atChan.present;
+    if (graceLive && IsKpadKind(remembered.kind) && !taken) {
+        return {remembered.kind, remembered.index, false};
+    }
+    return {};
+}
 
 // Must run before SDL's joystick subsystem is initialized (aurora does that
 // inside aurora_initialize); SDL only consults the hint on its first device scan.

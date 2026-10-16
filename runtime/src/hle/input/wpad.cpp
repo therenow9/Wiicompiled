@@ -123,13 +123,16 @@ extern "C" int32_t WPADProbe_HLE(uint32_t chan, uint32_t typePtr)
     // KPADStatus.dev_type) to pick its control scheme, and re-reads it when it
     // changes, which is what makes an extension swap mid-game work like on the
     // console. EffectiveKind keeps the last type through SDL's re-creation of
-    // the joystick after a swap.
+    // the joystick after a swap. A gamepad on the channel's own player index is
+    // a remote with a Classic Controller.
     const WiiRemoteInput::Kind kind = WiiRemoteInput::EffectiveKind(chan);
     if (WiiRemoteInput::IsRemoteChannel(chan)) {
         if (typePtr != 0) {
             uint32_t type = WpadContract::kExtensionCore;
             if (kind == WiiRemoteInput::Kind::RemoteWithNunchuk) type = 1u;
-            if (kind == WiiRemoteInput::Kind::RemoteWithClassic) type = 2u;
+            if (kind == WiiRemoteInput::Kind::RemoteWithClassic || kind == WiiRemoteInput::Kind::EmulatedClassic) {
+                type = 2u;
+            }
             Memory::Write32(typePtr, type);
         }
         return kStatusOk;

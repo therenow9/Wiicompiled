@@ -42,7 +42,7 @@ struct PortPreference {
   ControllerIdentity identity;
 };
 
-std::array<PortPreference, PAD_MAX_CONTROLLERS> g_portPreferences;
+std::array<PortPreference, PAD_MAX_ASSIGNABLE_PORTS> g_portPreferences;
 bool g_portPreferencesLoaded = false;
 
 std::string port_preferences_path() {
@@ -145,7 +145,7 @@ bool write_identity(SDL_IOStream* file, const ControllerIdentity& identity) {
   return write_string(file, identity.guid) && write_string(file, identity.serial);
 }
 
-bool read_port_preferences_file(std::array<PortPreference, PAD_MAX_CONTROLLERS>& preferences) {
+bool read_port_preferences_file(std::array<PortPreference, PAD_MAX_ASSIGNABLE_PORTS>& preferences) {
   const auto path = port_preferences_path();
   if (path.empty()) {
     return true;
@@ -161,14 +161,18 @@ bool read_port_preferences_file(std::array<PortPreference, PAD_MAX_CONTROLLERS>&
   bool ok = read_value(file, magic) && read_value(file, version) && magic == kPortPreferencesMagic &&
             version == kPortPreferencesVersion;
 
-  for (auto& preference : preferences) {
+  for (size_t port = 0; ok && port < preferences.size(); ++port) {
     uint8_t state = 0;
+    if (!read_value(file, state)) {
+      // A file written with only the GameCube ports ends here; the rest stay unset.
+      ok = port >= PAD_MAX_CONTROLLERS;
+      break;
+    }
     ControllerIdentity identity;
-    ok = ok && read_value(file, state) && state <= static_cast<uint8_t>(PortPreferenceState::Controller) &&
-         read_identity(file, identity);
+    ok = state <= static_cast<uint8_t>(PortPreferenceState::Controller) && read_identity(file, identity);
     if (ok) {
-      preference.state = static_cast<PortPreferenceState>(state);
-      preference.identity = std::move(identity);
+      preferences[port].state = static_cast<PortPreferenceState>(state);
+      preferences[port].identity = std::move(identity);
     }
   }
 
@@ -184,7 +188,7 @@ void ensure_port_preferences_loaded() {
     return;
   }
 
-  std::array<PortPreference, PAD_MAX_CONTROLLERS> preferences;
+  std::array<PortPreference, PAD_MAX_ASSIGNABLE_PORTS> preferences;
   if (read_port_preferences_file(preferences)) {
     g_portPreferences = std::move(preferences);
   }
@@ -267,7 +271,7 @@ int32_t effective_player_index(const GameController& controller) {
   return player >= 0 ? player : controller.m_playerIndex;
 }
 
-bool is_instance_claimed(const std::array<Uint32, PAD_MAX_CONTROLLERS>& claimedControllers, size_t claimedCount,
+bool is_instance_claimed(const std::array<Uint32, PAD_MAX_ASSIGNABLE_PORTS>& claimedControllers, size_t claimedCount,
                          Uint32 instance) {
   return std::find(claimedControllers.begin(), claimedControllers.begin() + claimedCount, instance) !=
          claimedControllers.begin() + claimedCount;
@@ -275,20 +279,17 @@ bool is_instance_claimed(const std::array<Uint32, PAD_MAX_CONTROLLERS>& claimedC
 
 void apply_port_preferences() noexcept {
   ensure_port_preferences_loaded();
-  if (!std::any_of(g_portPreferences.begin(), g_portPreferences.end(),
-                   [](const auto& preference) { return preference.state != PortPreferenceState::Unset; })) {
-    return;
-  }
-
   for (auto& [instance, controller] : g_GameControllers) {
     const int32_t player = effective_player_index(controller);
-    if (player >= 0 && player < PAD_MAX_CONTROLLERS && g_portPreferences[player].state != PortPreferenceState::Unset) {
-      // Keep SDL's default player assignment from taking explicitly configured ports
+    // Keep SDL's default player assignment from taking explicitly configured ports, and every port past the
+    // GameCube ones: those only take the controller assigned there, matched below
+    if (player >= PAD_MAX_CONTROLLERS ||
+        (player >= 0 && g_portPreferences[player].state != PortPreferenceState::Unset)) {
       assign_player_index(controller, -1);
     }
   }
 
-  std::array<Uint32, PAD_MAX_CONTROLLERS> claimedControllers{};
+  std::array<Uint32, PAD_MAX_ASSIGNABLE_PORTS> claimedControllers{};
   size_t claimedCount = 0;
   for (uint32_t port = 0; port < g_portPreferences.size(); ++port) {
     const auto& preference = g_portPreferences[port];
@@ -520,7 +521,7 @@ void controller_rumble(uint32_t instance, uint16_t low_freq_intensity, uint16_t 
 uint32_t controller_count() noexcept { return g_GameControllers.size(); }
 
 void persist_controller_for_player(uint32_t player, const GameController* controller) noexcept {
-  if (player >= PAD_MAX_CONTROLLERS) {
+  if (player >= PAD_MAX_ASSIGNABLE_PORTS) {
     return;
   }
 
