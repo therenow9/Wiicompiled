@@ -72,6 +72,7 @@
 #include "runtime_product.h"
 #include "recomp_mod_loader.h"
 #include <aurora/aurora.h>
+#include <SDL3/SDL_video.h>
 #include <aurora/gfx.h>
 #include <dolphin/gx/GXAurora.h>
 #include <dolphin/vi.h>
@@ -1360,6 +1361,21 @@ int RuntimeMain(int argc, char** argv) {
         const std::string auroraCachePath = RuntimeConfigFile::PathToUtf8(rendererCacheDirectory);
         auroraConfig.userPath = auroraUserPath.c_str();
         auroraConfig.cachePath = auroraCachePath.c_str();
+        // An optional window icon a pack can place beside Config.toml: width and height as little-endian
+        // uint32, then RGBA8 pixels. Aurora sets it when it creates the window.
+        static std::vector<uint8_t> windowIcon;
+        if (std::ifstream iconFile{applicationDataDirectory / "window-icon.rgba", std::ios::binary}) {
+            uint32_t iconSize[2] = {};
+            if (iconFile.read(reinterpret_cast<char*>(iconSize), sizeof(iconSize)) && iconSize[0] > 0 &&
+                iconSize[0] <= 1024 && iconSize[1] > 0 && iconSize[1] <= 1024) {
+                windowIcon.resize(size_t{4} * iconSize[0] * iconSize[1]);
+                if (iconFile.read(reinterpret_cast<char*>(windowIcon.data()), static_cast<std::streamsize>(windowIcon.size()))) {
+                    auroraConfig.iconRGBA8 = windowIcon.data();
+                    auroraConfig.iconWidth = iconSize[0];
+                    auroraConfig.iconHeight = iconSize[1];
+                }
+            }
+        }
         auroraConfig.logCallback = &RuntimeAuroraLogCallback;
         auroraConfig.logLevel = LOG_DEBUG;
         const bool configWidescreen = RuntimeConfigFile::WidescreenEnabled(true);
@@ -1444,6 +1460,24 @@ int RuntimeMain(int argc, char** argv) {
             RT_LOG(RT_TAG_RUNTIME) << "graphics backend: " << backendDisplayName(auroraInfo.backend)
                       << std::endl;
         }
+#if defined(_WIN32)
+        // The taskbar keeps the generic icon, apparently because it asks while the game is still loading. A different
+        // icon handle once the window has answered messages for a few seconds makes it ask again.
+        if (auroraConfig.iconRGBA8 != nullptr) {
+            const HWND hwnd = static_cast<HWND>(SDL_GetPointerProperty(SDL_GetWindowProperties(auroraInfo.window), SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr));
+            if (const HICON hicon = hwnd != nullptr ? CopyIcon(reinterpret_cast<HICON>(SendMessageW(hwnd, WM_GETICON, ICON_BIG, 0))) : nullptr) {
+                std::thread([hwnd, hicon] {
+                    for (int answered = 0, tries = 0; answered < 3 && tries < 120; ++tries) {
+                        DWORD_PTR result = 0;
+                        answered = SendMessageTimeoutW(hwnd, WM_NULL, 0, 0, SMTO_ABORTIFHUNG, 250, &result) != 0 ? answered + 1 : 0;
+                        Sleep(1000);
+                    }
+                    PostMessageW(hwnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(hicon));
+                    PostMessageW(hwnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(hicon));
+                }).detach();
+            }
+        }
+#endif
         aurora_set_frame_worker_wait_callback(ServiceGuestTimingDuringAuroraFrameWait);
         GxGuestWrite::InstallAuroraHooks();
         UpdateMkwDynamicAspectSurface(auroraInfo.windowSize.native_fb_width,

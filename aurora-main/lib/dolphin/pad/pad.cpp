@@ -399,7 +399,7 @@ const char* PADGetNameForControllerIndex(const u32 idx) {
 }
 
 void PADSetPortForIndex(const u32 idx, const u32 port) {
-  if (port >= PAD_MAX_CONTROLLERS) return;
+  if (port >= PAD_MAX_ASSIGNABLE_PORTS) return;
   const auto* ctrl = __PADGetControllerForIndex(idx);
   if (ctrl == nullptr) {
     return;

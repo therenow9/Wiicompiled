@@ -26,6 +26,9 @@
 #define PAD_ERR_TRANSFER -3
 
 #define PAD_MAX_CONTROLLERS 4
+// Player indices a controller can be assigned and persisted to: the GameCube
+// ports first, then ports the host reads by other means (Wii channels).
+#define PAD_MAX_ASSIGNABLE_PORTS 8
 
 #define PAD_BUTTON_LEFT 0x0001
 #define PAD_BUTTON_RIGHT 0x0002
