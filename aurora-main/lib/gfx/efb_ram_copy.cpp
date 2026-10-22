@@ -71,6 +71,10 @@ struct AsyncSlot {
   uint32_t hostHeight = 0;
   HostPixelOrder order = HostPixelOrder::RGBA;
   AsyncState state = AsyncState::Idle;
+  // The bytes at dest when the last copy was issued, or since written by this runtime. A Wii lands the copy before a
+  // later CPU write, so other bytes there mean the guest wrote it, or freed and reused it, while the readback was late.
+  std::array<uint8_t, kAsyncReadbackMaxBytes> written{};
+  size_t writtenSize = 0;
 };
 
 std::vector<PendingCopy> g_pending;
@@ -145,14 +149,21 @@ void complete_async_slot(void* dest, uint64_t generation, wgpu::MapAsyncStatus s
   if (status == wgpu::MapAsyncStatus::Success) {
     const auto* pixels = static_cast<const uint8_t*>(slot.buffer.GetConstMappedRange(0, slot.bufferSize));
     if (pixels != nullptr) {
+      const size_t outputSize = encoded_size(slot.format, slot.width, slot.height);
+      if (outputSize != slot.writtenSize || std::memcmp(slot.dest, slot.written.data(), outputSize) != 0) {
+        Log.info("Dropped a late EFB RAM readback: the guest changed its destination");
+        slot.buffer.Unmap();
+        g_asyncSlots.erase(it);
+        return;
+      }
       // Writes guest RAM from the event-queue thread while the guest may be reading it. The only
       // consumer min/maxes depth for a fade factor, so a torn tile just mixes two frames' depths.
-      const size_t outputSize = encoded_size(slot.format, slot.width, slot.height);
       if (!encode(slot.dest, outputSize, slot.format, slot.width, slot.height, pixels, slot.hostWidth, slot.hostHeight,
                   slot.bytesPerRow, slot.order)) {
         Log.error("Failed to encode async EFB RAM copy format=0x{:x} size={}x{}", static_cast<unsigned>(slot.format),
                   slot.width, slot.height);
       }
+      std::memcpy(slot.written.data(), slot.dest, outputSize);
       // Guest RAM written from outside the embedder, so nothing bumps its write generation and a
       // texture cached over this range would keep its digest.
       notify_guest_write(slot.dest, outputSize);
@@ -207,12 +218,17 @@ void schedule(void* dest, uint32_t width, uint32_t height, GXTexFmt format, Text
       if (g_asyncSlots.size() >= kMaxAsyncSlots) {
         async = false;
       } else {
-        g_asyncSlots.try_emplace(dest);
+        auto& slot = g_asyncSlots.try_emplace(dest).first->second;
         // No readback has landed here yet. 0xff decodes to far Z, which the probe reads as unobstructed
         // so a new flare fades in; zero-filled RAM would decode as fully occluded.
         std::memset(dest, 0xff, encodedSize);
+        slot.written.fill(0xff);
+        slot.writtenSize = encodedSize;
         notify_guest_write(dest, encodedSize);
       }
+    } else {
+      std::memcpy(it->second.written.data(), dest, encodedSize);
+      it->second.writtenSize = encodedSize;
     }
   }
 
