@@ -2,6 +2,7 @@
 #include "memory.h"
 #include "hle/controller_status_contract.h"
 #include "input_bindings.h"
+#include "wiimote_host.h"
 
 #include <algorithm>
 #include <atomic>
@@ -113,6 +114,7 @@ extern "C" uint32_t PAD__Read_HLE(uint32_t statusPtr)
 
     PADStatus statuses[PAD_CHANMAX]{};
     uint32_t rumbleMask = PADRead(statuses);
+    Wiimote::SampleGamepads();
 
     FillTriggersHeldByButtons(statuses);
     InputBindings::Apply(statuses);

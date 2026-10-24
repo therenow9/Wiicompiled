@@ -1,13 +1,16 @@
 #include "wiimote_host.h"
 
+#include "gamepad_remote.h"
 #include "input_bindings.h"
 #include "runtime_config.h"
 #include "runtime_log.h"
 #include "wiimote_extension.h"
 #include "wiimote_platform.h"
 
+#include <SDL3/SDL_gamepad.h>
 #include <SDL3/SDL_hidapi.h>
 #include <SDL3/SDL_hints.h>
+#include <dolphin/pad.h>
 
 #include <algorithm>
 #include <array>
@@ -769,6 +772,104 @@ size_t Manager::Waiting() {
 
 bool g_enabled = false;
 
+// The gamepad on the player index after the GameCube ports, read as a Classic
+// Controller: a/b/x/y by position, as on a real one. The Bluetooth tick may run inside
+// Aurora's frame wait, which must not enter Aurora, so it reads what Sample() last took.
+class PadClassics final : public GamepadSource {
+public:
+    void Sample() {
+        std::array<ClassicState, Bluetooth::kRemoteSlots> states{};
+        std::array<bool, Bluetooth::kRemoteSlots> present{};
+        for (size_t slot = 0; slot < Bluetooth::kRemoteSlots; ++slot) present[slot] = Poll(slot, states[slot]);
+        std::array<bool, Bluetooth::kRemoteSlots> rumble{};
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_states = states;
+            m_present = present;
+            rumble = m_rumble;
+        }
+        for (size_t slot = 0; slot < Bluetooth::kRemoteSlots; ++slot) {
+            const bool on = present[slot] && rumble[slot] && PAD_HLE_RumbleEnabled();
+            if (on != m_rumbling[slot]) {
+                PADControlMotor(static_cast<u32>(PAD_MAX_CONTROLLERS + slot), on ? PAD_MOTOR_RUMBLE : PAD_MOTOR_STOP);
+                m_rumbling[slot] = on;
+            }
+        }
+    }
+
+    bool Read(size_t slot, ClassicState& state) override {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        state = m_states[slot];
+        return m_present[slot];
+    }
+
+    void Rumble(size_t slot, bool on) override {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_rumble[slot] = on;
+    }
+
+    uint64_t NowUs() override {
+        return static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(Clock::now().time_since_epoch()).count());
+    }
+
+private:
+    static bool Poll(size_t slot, ClassicState& state) {
+        const s32 index = PADGetIndexForPort(static_cast<u32>(PAD_MAX_CONTROLLERS + slot));
+        SDL_Gamepad* gamepad = index < 0 ? nullptr : PADGetSDLGamepadForIndex(static_cast<u32>(index));
+        if (gamepad == nullptr) return false;
+        state = {};
+        if (InputBindings::InputBlocked()) return true;
+        // SDL's Wii driver posts a Wii U Pro Controller's buttons raw, numbered like SDL_GAMEPAD_BUTTON_*.
+        const char* name = SDL_GetGamepadName(gamepad);
+        SDL_Joystick* raw = name != nullptr && std::strstr(name, "Wii U Pro Controller") != nullptr
+                                ? SDL_GetGamepadJoystick(gamepad)
+                                : nullptr;
+        const auto button = [&](SDL_GamepadButton sdl, uint16_t classic) {
+            if (raw != nullptr ? SDL_GetJoystickButton(raw, sdl) : SDL_GetGamepadButton(gamepad, sdl)) {
+                state.buttons |= classic;
+            }
+        };
+        button(SDL_GAMEPAD_BUTTON_EAST, ClassicButton::A);
+        button(SDL_GAMEPAD_BUTTON_SOUTH, ClassicButton::B);
+        button(SDL_GAMEPAD_BUTTON_NORTH, ClassicButton::X);
+        button(SDL_GAMEPAD_BUTTON_WEST, ClassicButton::Y);
+        button(SDL_GAMEPAD_BUTTON_START, ClassicButton::Plus);
+        button(SDL_GAMEPAD_BUTTON_BACK, ClassicButton::Minus);
+        button(SDL_GAMEPAD_BUTTON_GUIDE, ClassicButton::Home);
+        button(SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, ClassicButton::L);
+        button(SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, ClassicButton::R);
+        button(SDL_GAMEPAD_BUTTON_DPAD_UP, ClassicButton::Up);
+        button(SDL_GAMEPAD_BUTTON_DPAD_DOWN, ClassicButton::Down);
+        button(SDL_GAMEPAD_BUTTON_DPAD_LEFT, ClassicButton::Left);
+        button(SDL_GAMEPAD_BUTTON_DPAD_RIGHT, ClassicButton::Right);
+        const auto axis = [&](SDL_GamepadAxis sdl) {
+            return std::clamp(static_cast<float>(SDL_GetGamepadAxis(gamepad, sdl)) / 32767.0f, -1.0f, 1.0f);
+        };
+        if (axis(SDL_GAMEPAD_AXIS_LEFT_TRIGGER) >= 0.5f) state.buttons |= ClassicButton::ZL;
+        if (axis(SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) >= 0.5f) state.buttons |= ClassicButton::ZR;
+        state.leftX = axis(SDL_GAMEPAD_AXIS_LEFTX);
+        state.leftY = -axis(SDL_GAMEPAD_AXIS_LEFTY);
+        state.rightX = axis(SDL_GAMEPAD_AXIS_RIGHTX);
+        state.rightY = -axis(SDL_GAMEPAD_AXIS_RIGHTY);
+        // Only the full-press click of L/R reaches SDL; report it as a full pull.
+        state.triggerL = (state.buttons & ClassicButton::L) != 0 ? 1.0f : 0.0f;
+        state.triggerR = (state.buttons & ClassicButton::R) != 0 ? 1.0f : 0.0f;
+        return true;
+    }
+
+    std::mutex m_mutex;
+    std::array<ClassicState, Bluetooth::kRemoteSlots> m_states{};
+    std::array<bool, Bluetooth::kRemoteSlots> m_present{};
+    std::array<bool, Bluetooth::kRemoteSlots> m_rumble{};
+    std::array<bool, Bluetooth::kRemoteSlots> m_rumbling{};
+};
+
+PadClassics& Gamepads() {
+    static PadClassics* gamepads = new PadClassics();
+    return *gamepads;
+}
+
 } // namespace HostDetail
 
 using namespace HostDetail;
@@ -799,6 +900,15 @@ void Shutdown() {
 
 Bluetooth::RemoteHost& Host() {
     return TheManager();
+}
+
+Bluetooth::RemoteHost& HostWithGamepads() {
+    static GamepadRemoteHost* host = new GamepadRemoteHost(TheManager(), Gamepads());
+    return *host;
+}
+
+void SampleGamepads() {
+    Gamepads().Sample();
 }
 
 SlotInfo Slot(size_t slot) {

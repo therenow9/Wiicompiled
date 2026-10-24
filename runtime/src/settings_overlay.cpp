@@ -889,21 +889,31 @@ std::string ControllerLabel(uint32_t index) {
     return name != nullptr ? name : "Unknown controller";
 }
 
+// Ports after the GameCube ones are the Wii Remote slots, where a gamepad plays as a Classic Controller.
+std::string PortLabel(uint32_t port) {
+    return port < PAD_MAX_CONTROLLERS ? "Player " + std::to_string(port + 1)
+                                      : "Wii " + std::to_string(port - PAD_MAX_CONTROLLERS + 1);
+}
+
 // One row per player: the device combo replaces separate assign/unassign/keyboard controls.
 void DrawPlayerRow(uint32_t port) {
+    const bool wii = port >= PAD_MAX_CONTROLLERS;
     const bool keyboard = KeyboardActive(port);
     const int32_t assigned = PADGetIndexForPort(port);
+    const Wiimote::SlotInfo remote = Wiimote::Slot(wii ? port - PAD_MAX_CONTROLLERS : port);
     std::string preview = "None";
-    if (keyboard) {
+    if (wii && remote.attached) {
+        preview = WiiRemoteLabel(remote);
+    } else if (keyboard) {
         preview = "Keyboard and mouse";
     } else if (assigned >= 0) {
         preview = ControllerLabel(static_cast<uint32_t>(assigned));
-    } else if (const Wiimote::SlotInfo remote = Wiimote::Slot(port); remote.attached) {
+    } else if (remote.attached) {
         preview = WiiRemoteLabel(remote);
     }
 
     ImGui::PushID(static_cast<int>(port));
-    const std::string label = "Player " + std::to_string(port + 1);
+    const std::string label = PortLabel(port);
     ImGui::AlignTextToFramePadding();
     if (ImGui::RadioButton(label.c_str(), g_controllerPort == static_cast<int>(port))) {
         g_controllerPort = static_cast<int>(port);
@@ -920,9 +930,9 @@ void DrawPlayerRow(uint32_t port) {
         const uint32_t controllerCount = PADCount();
         for (uint32_t index = 0; index < controllerCount; ++index) {
             std::string item = ControllerLabel(index);
-            for (uint32_t other = 0; other < PAD_MAX_CONTROLLERS; ++other) {
+            for (uint32_t other = 0; other < PAD_MAX_ASSIGNABLE_PORTS; ++other) {
                 if (other != port && PADGetIndexForPort(other) == static_cast<s32>(index)) {
-                    item += " (Player " + std::to_string(other + 1) + ")";
+                    item += " (" + PortLabel(other) + ")";
                     break;
                 }
             }
@@ -935,7 +945,7 @@ void DrawPlayerRow(uint32_t port) {
             }
             ImGui::PopID();
         }
-        if (ImGui::Selectable("Keyboard and mouse", keyboard)) {
+        if (!wii && ImGui::Selectable("Keyboard and mouse", keyboard)) {
             SetKeyboardActive(port, true);
         }
         ImGui::EndCombo();
@@ -945,7 +955,7 @@ void DrawPlayerRow(uint32_t port) {
 
 void DrawControllerSettings() {
     ImGui::Dummy(ImVec2(kControllerMenuWidth, 0.0f));
-    for (uint32_t port = 0; port < PAD_MAX_CONTROLLERS; ++port) {
+    for (uint32_t port = 0; port < PAD_MAX_ASSIGNABLE_PORTS; ++port) {
         DrawPlayerRow(port);
     }
     bool anyRemote = false;
@@ -957,15 +967,24 @@ void DrawControllerSettings() {
     }
 
     const uint32_t port = static_cast<uint32_t>(g_controllerPort);
-    ImGui::SeparatorText(("Player " + std::to_string(port + 1)).c_str());
-    const Wiimote::SlotInfo remote = Wiimote::Slot(port);
+    ImGui::SeparatorText(PortLabel(port).c_str());
+    const bool wii = port >= PAD_MAX_CONTROLLERS;
+    const uint32_t slot = wii ? port - PAD_MAX_CONTROLLERS : port;
+    const Wiimote::SlotInfo remote = Wiimote::Slot(slot);
     if (remote.attached) {
-        DrawWiiRemoteDetails(port, remote);
-        if (KeyboardActive(port) || PADGetIndexForPort(port) >= 0) {
+        DrawWiiRemoteDetails(slot, remote);
+        if (!wii && (KeyboardActive(port) || PADGetIndexForPort(port) >= 0)) {
             ImGui::Spacing();
         }
     }
-    if (KeyboardActive(port)) {
+    if (wii) {
+        if (!remote.attached && PADGetIndexForPort(port) < 0) {
+            ImGui::TextDisabled("No device. Pick one in the list above.");
+        } else if (!remote.attached) {
+            ImGui::TextUnformatted("The game reads it as a Wii Remote with a Classic Controller.");
+            ImGui::TextDisabled("a/b/x/y by position; a Wii Remote on this slot takes over.");
+        }
+    } else if (KeyboardActive(port)) {
         DrawKeyboardSettings(port);
     } else if (PADGetIndexForPort(port) < 0) {
         if (!remote.attached) {

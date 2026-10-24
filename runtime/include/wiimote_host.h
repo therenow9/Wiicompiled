@@ -37,6 +37,11 @@ void Initialize();
 void Shutdown();
 
 Bluetooth::RemoteHost& Host();
+// Host() on the slots it has a remote on; elsewhere the gamepad assigned to the
+// slot's player index (after the GameCube ports) as a remote with a Classic Controller.
+Bluetooth::RemoteHost& HostWithGamepads();
+// Reads those gamepads for HostWithGamepads(); on the game thread, outside Aurora's frame wait.
+void SampleGamepads();
 
 SlotInfo Slot(size_t slot);
 PairingInfo Pairing();

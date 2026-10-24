@@ -64,7 +64,7 @@ uint64_t NowUs() {
 
 Bluetooth::Controller& ControllerFor(Device& device) {
     if (!device.controller) {
-        device.controller = std::make_unique<Bluetooth::Controller>(Wiimote::Host());
+        device.controller = std::make_unique<Bluetooth::Controller>(Wiimote::HostWithGamepads());
     }
     return *device.controller;
 }
