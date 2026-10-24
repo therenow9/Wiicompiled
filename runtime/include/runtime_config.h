@@ -834,7 +834,8 @@ inline bool AttenuateMusicWhenMediaPlays(bool fallback = false) {
 
 // Bluetooth Wii Remotes. Read once before SDL's joystick subsystem comes up, so a
 // change only takes effect on the next launch.
-inline bool WiiRemotesEnabled(bool fallback = false) {
+// On by default: off, SDL's own Wii driver takes a remote as an ordinary gamepad.
+inline bool WiiRemotesEnabled(bool fallback = true) {
     return Get().wiiRemotes.value_or(fallback);
 }
 
@@ -843,7 +844,8 @@ inline bool SetWiiRemotesEnabled(bool value) {
     return WriteSetting("controller", "wii_remotes", value ? "true" : "false");
 }
 
-inline bool WiiAutoPairEnabled(bool fallback = true) {
+// Off by default: the search, repeated while no remote is connected, can stutter other Bluetooth devices.
+inline bool WiiAutoPairEnabled(bool fallback = false) {
     return Get().wiiAutoPair.value_or(fallback);
 }
 
