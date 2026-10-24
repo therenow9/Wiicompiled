@@ -1359,6 +1359,12 @@ int RuntimeMain(int argc, char** argv) {
         AuroraConfig auroraConfig = {};
         auroraConfig.appName = RuntimeProduct::Active().displayName.data();
         const auto applicationDataDirectory = RuntimeConfigFile::ApplicationDataDirectory();
+        // An optional window title a pack can place beside Config.toml, one UTF-8 line: one product runs several packs.
+        static std::string windowTitle;
+        if (std::ifstream titleFile{applicationDataDirectory / "window-title.txt"};
+            titleFile && std::getline(titleFile, windowTitle) && !windowTitle.empty()) {
+            auroraConfig.appName = windowTitle.c_str();
+        }
         const auto rendererCacheDirectory = applicationDataDirectory / "Cache";
         std::error_code rendererPathError;
         std::filesystem::create_directories(rendererCacheDirectory, rendererPathError);

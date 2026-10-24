@@ -5,7 +5,7 @@ namespace RuntimeProduct {
 const Descriptor& Active() noexcept {
     static constexpr Descriptor descriptor{
         Kind::RetroRewind,
-        "Retro Rewind",
+        "Retro Rewind - 8 Player Splitscreen",
     };
     return descriptor;
 }
