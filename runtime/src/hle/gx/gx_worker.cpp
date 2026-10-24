@@ -307,7 +307,7 @@ void Start() {
     if (Active()) {
         return;
     }
-    if (!RuntimeConfigFile::GxWorkerEnabled(true)) {
+    if (!RuntimeConfigFile::GxWorkerEnabled()) {
         RT_LOGF(RT_TAG_GX, "GX worker disabled\n");
         return;
     }

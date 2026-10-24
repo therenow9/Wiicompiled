@@ -279,7 +279,7 @@ inline void EnsureConfigFile() {
               "skip_unready_pipelines = true\n"
               "vsync = false\n"
               "# Runs GX command processing on its own thread. Read once, at startup.\n"
-              "gx_worker = true\n"
+              "gx_worker = false\n"
               "disable_copy_filter = true\n"
               "show_fps = true\n"
               "# Dolphin-style custom textures. When enabled, the renderer indexes\n"
@@ -823,7 +823,9 @@ inline bool AudioMixWorkerEnabled(bool fallback = true) {
     return Get().audioMixWorker.value_or(fallback);
 }
 
-inline bool GxWorkerEnabled(bool fallback = true) {
+// Off by default: while the worker's ring is full the game thread waits without feeding audio,
+// which crackles in splitscreen races.
+inline bool GxWorkerEnabled(bool fallback = false) {
     return Get().gxWorker.value_or(fallback);
 }
 
