@@ -299,7 +299,7 @@ void ApplyConfiguredMappings() {
 }
 
 bool g_wiiRemotesEnabled = RuntimeConfigFile::WiiRemotesEnabled();
-bool g_wiiAutoPair = RuntimeConfigFile::WiiAutoPairEnabled(true);
+bool g_wiiAutoPair = RuntimeConfigFile::WiiAutoPairEnabled();
 bool g_wiiSensorBarAbove = RuntimeConfigFile::WiiSensorBarAbove(false);
 int g_wiiIrSensitivity = RuntimeConfigFile::WiiIrSensitivity(3);
 
@@ -889,14 +889,9 @@ std::string ControllerLabel(uint32_t index) {
     return name != nullptr ? name : "Unknown controller";
 }
 
-// Ports after the GameCube ones are the Wii Remote slots, where a gamepad plays as a Classic Controller.
-std::string PortLabel(uint32_t port) {
-    return port < PAD_MAX_CONTROLLERS ? "Player " + std::to_string(port + 1)
-                                      : "Wii " + std::to_string(port - PAD_MAX_CONTROLLERS + 1);
-}
-
 // One row per player: the device combo replaces separate assign/unassign/keyboard controls.
 void DrawPlayerRow(uint32_t port) {
+    // Ports after the GameCube ones are the Wii Remote slots, where a gamepad plays as a Classic Controller.
     const bool wii = port >= PAD_MAX_CONTROLLERS;
     const bool keyboard = KeyboardActive(port);
     const int32_t assigned = PADGetIndexForPort(port);
@@ -913,7 +908,7 @@ void DrawPlayerRow(uint32_t port) {
     }
 
     ImGui::PushID(static_cast<int>(port));
-    const std::string label = PortLabel(port);
+    const std::string label = "Player " + std::to_string(port + 1);
     ImGui::AlignTextToFramePadding();
     if (ImGui::RadioButton(label.c_str(), g_controllerPort == static_cast<int>(port))) {
         g_controllerPort = static_cast<int>(port);
@@ -932,7 +927,7 @@ void DrawPlayerRow(uint32_t port) {
             std::string item = ControllerLabel(index);
             for (uint32_t other = 0; other < PAD_MAX_ASSIGNABLE_PORTS; ++other) {
                 if (other != port && PADGetIndexForPort(other) == static_cast<s32>(index)) {
-                    item += " (" + PortLabel(other) + ")";
+                    item += " (Player " + std::to_string(other + 1) + ")";
                     break;
                 }
             }
@@ -967,7 +962,7 @@ void DrawControllerSettings() {
     }
 
     const uint32_t port = static_cast<uint32_t>(g_controllerPort);
-    ImGui::SeparatorText(PortLabel(port).c_str());
+    ImGui::SeparatorText(("Player " + std::to_string(port + 1)).c_str());
     const bool wii = port >= PAD_MAX_CONTROLLERS;
     const uint32_t slot = wii ? port - PAD_MAX_CONTROLLERS : port;
     const Wiimote::SlotInfo remote = Wiimote::Slot(slot);
