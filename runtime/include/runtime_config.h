@@ -85,6 +85,9 @@ struct RuntimeUserConfig {
     // comma-separated SDL-style physical button names ("south", or
     // "dpad_up,left_shoulder") as values; pressing either bound button counts.
     std::array<std::optional<std::string>, 12> controllerButtons;
+    // [controller.gamecube1..4] and [controller.wii1..4]: one F10 row's own bindings, in the same form. The
+    // GameCube rows fall back to the shared keys above; the Wii Remote rows hold Classic Controller keys.
+    std::array<std::map<std::string, std::string>, 8> controllerRowButtons;
     std::optional<bool> rumbleEnabled;
     std::optional<int32_t> muteHotkey;
     std::map<std::string, std::string> controllerExpressions;
@@ -376,6 +379,11 @@ inline void AppendOverlayRoots(RuntimeUserConfig& config, const std::string& roo
     }
 }
 
+// F10's controller row as its [controller.<table>]: gamecube1..gamecube4, then wii1..wii4.
+inline std::string ControllerRowTable(size_t row) {
+    return row < 4 ? "gamecube" + std::to_string(row + 1) : "wii" + std::to_string(row - 3);
+}
+
 // Reads every supported setting out of a parsed Config.toml document.
 inline RuntimeUserConfig ParseConfigDocument(const toml::value& document) {
     RuntimeUserConfig config;
@@ -398,6 +406,16 @@ inline RuntimeUserConfig ParseConfigDocument(const toml::value& document) {
         for (const auto& [key, value] : section->as_table()) {
             if (key.rfind("expr_", 0) == 0 && value.is_string()) {
                 config.controllerExpressions[key] = value.as_string();
+            }
+            for (size_t row = 0; row < config.controllerRowButtons.size(); ++row) {
+                if (key != ControllerRowTable(row) || !value.is_table()) {
+                    continue;
+                }
+                for (const auto& [button, binding] : value.as_table()) {
+                    if (binding.is_string()) {
+                        config.controllerRowButtons[row][button] = binding.as_string();
+                    }
+                }
             }
         }
     }
@@ -518,10 +536,6 @@ inline const RuntimeUserConfig& Get() {
 inline RuntimeUserConfig& Mutable() {
     return const_cast<RuntimeUserConfig&>(Get());
 }
-
-inline constexpr std::array<std::string_view, 12> kControllerButtonKeys = {
-    "a", "b", "x", "y", "start", "z", "l", "r", "up", "down", "left", "right",
-};
 
 inline const std::optional<std::string>& ControllerButton(size_t index) {
     static const std::optional<std::string> empty;
@@ -665,12 +679,21 @@ inline bool SetDisabledPostProcessingPaths(uint32_t value) {
     return WriteSetting("video", "disabled_post_processing_paths", formatted.str());
 }
 
-inline bool SetControllerButton(size_t index, std::string value) {
-    if (index >= kControllerButtonKeys.size()) {
+inline std::optional<std::string> ControllerRowButton(size_t row, std::string_view key) {
+    if (row >= Get().controllerRowButtons.size()) {
+        return std::nullopt;
+    }
+    const auto& own = Get().controllerRowButtons[row];
+    const auto it = own.find(std::string(key));
+    return it == own.end() ? std::nullopt : std::optional<std::string>(it->second);
+}
+
+inline bool SetControllerRowButton(size_t row, std::string_view key, std::string value) {
+    if (row >= Get().controllerRowButtons.size()) {
         return false;
     }
-    Mutable().controllerButtons[index] = value;
-    return WriteSetting("controller", kControllerButtonKeys[index], FormatString(value));
+    Mutable().controllerRowButtons[row][std::string(key)] = value;
+    return WriteSetting("controller." + ControllerRowTable(row), key, FormatString(value));
 }
 
 inline std::string ControllerExpression(const std::string& key) {

@@ -241,6 +241,43 @@ std::string NativeBindingConfig(uint32_t binding) {
     return value;
 }
 
+std::string NativeBindingConfig(uint32_t primary, uint32_t alternate) {
+    std::string value = NativeBindingConfig(primary);
+    if (alternate != PAD_NATIVE_BUTTON_INVALID) value += ',' + NativeBindingConfig(alternate);
+    return value;
+}
+
+struct ConfiguredBinding {
+    std::optional<uint32_t> primary;
+    uint32_t alternate = PAD_NATIVE_BUTTON_INVALID;
+};
+
+// A Config.toml binding's inputs; an unknown name is left out, and logged when loading
+// (the Classic page parses every frame).
+ConfiguredBinding ParseBinding(const std::string& value, std::string_view key, bool log) {
+    const ControllerBindingPair binding = SplitControllerBinding(value);
+    ConfiguredBinding parsed;
+    if (const NativeButtonItem* native = FindNativeButton(binding.primary)) {
+        parsed.primary = ConfiguredNativeButton(*native, binding.primary);
+    } else if (log) {
+        RT_LOG(RT_TAG_CONFIG) << "Unknown controller." << key << " button '" << binding.primary << "'" << std::endl;
+    }
+    if (!binding.secondary.empty()) {
+        if (const NativeButtonItem* native = FindNativeButton(binding.secondary)) {
+            parsed.alternate = ConfiguredNativeButton(*native, binding.secondary);
+        } else if (log) {
+            RT_LOG(RT_TAG_CONFIG) << "Unknown controller." << key << " secondary button '" << binding.secondary
+                                  << "'" << std::endl;
+        }
+    }
+    return parsed;
+}
+
+bool IsWiiUPro(int32_t controllerIndex) {
+    const char* name = PADGetNameForControllerIndex(static_cast<uint32_t>(controllerIndex));
+    return name != nullptr && std::string_view(name).find("Wii U Pro") != std::string_view::npos;
+}
+
 
 void SetTopBarVisible(bool visible) {
     if (g_topBarVisible == visible) {
@@ -250,6 +287,9 @@ void SetTopBarVisible(bool visible) {
 }
 
 void ApplyConfiguredMappings() {
+    const auto& rows = RuntimeConfigFile::Get().controllerRowButtons;
+    const bool perRow = std::any_of(rows.begin(), rows.begin() + PAD_MAX_CONTROLLERS,
+                                       [](const auto& row) { return !row.empty(); });
     for (uint32_t port = 0; port < PAD_MAX_CONTROLLERS; ++port) {
         const int32_t controllerIndex = PADGetIndexForPort(port);
         if (controllerIndex == g_configuredControllerIndices[port]) {
@@ -259,13 +299,9 @@ void ApplyConfiguredMappings() {
         if (controllerIndex < 0) {
             continue;
         }
-        // The [controller] bindings are positional and shared by every port, so
-        // they describe whatever pad the user set them up with (usually an Xbox
-        // layout: a = south). A Wii U Pro Controller has a fixed, known layout
-        // (A on the east position) that aurora already maps by name; applying
-        // the shared bindings on top swaps A/B and X/Y.
-        if (const char* name = PADGetNameForControllerIndex(static_cast<uint32_t>(controllerIndex));
-            name != nullptr && std::string_view(name).find("Wii U Pro") != std::string_view::npos) {
+        // Row bindings, else the shared [controller] ones, are positional; a Wii U Pro is already
+        // mapped by name, and they would swap its A/B and X/Y.
+        if (IsWiiUPro(controllerIndex)) {
             continue;
         }
 
@@ -273,30 +309,47 @@ void ApplyConfiguredMappings() {
         if (PADGetButtonMappings(port, &count) == nullptr || count != PAD_BUTTON_COUNT) {
             continue;
         }
+        // The layout aurora saved for this pad's model may be another row's (two pads of one model
+        // share it), so with per-row tables a pad starts from its defaults.
+        if (perRow) {
+            PADRestoreDefaultMapping(port);
+        }
         for (size_t i = 0; i < kControllerButtons.size(); ++i) {
-            const auto& configured = RuntimeConfigFile::ControllerButton(i);
+            auto configured = RuntimeConfigFile::ControllerRowButton(port, kControllerButtons[i].configKey);
+            if (!configured) {
+                configured = RuntimeConfigFile::ControllerButton(i);
+            }
             if (!configured) {
                 continue;
             }
-            const ControllerBindingPair binding = SplitControllerBinding(*configured);
-            if (const NativeButtonItem* native = FindNativeButton(binding.primary)) {
-                PADSetButtonMapping(port, PADButtonMapping{ConfiguredNativeButton(*native, binding.primary), kControllerButtons[i].padButton});
-            } else {
-                RT_LOG(RT_TAG_CONFIG) << "Unknown controller." << kControllerButtons[i].configKey
-                          << " button '" << binding.primary << "'" << std::endl;
+            const ConfiguredBinding binding = ParseBinding(*configured, kControllerButtons[i].configKey, true);
+            if (binding.primary) {
+                PADSetButtonMapping(port, PADButtonMapping{*binding.primary, kControllerButtons[i].padButton});
             }
-            uint32_t altNative = PAD_NATIVE_BUTTON_INVALID;
-            if (!binding.secondary.empty()) {
-                if (const NativeButtonItem* native = FindNativeButton(binding.secondary)) {
-                    altNative = ConfiguredNativeButton(*native, binding.secondary);
-                } else {
-                    RT_LOG(RT_TAG_CONFIG) << "Unknown controller." << kControllerButtons[i].configKey
-                              << " secondary button '" << binding.secondary << "'" << std::endl;
-                }
-            }
-            PADSetAltButtonMapping(port, PADButtonMapping{altNative, kControllerButtons[i].padButton});
+            PADSetAltButtonMapping(port, PADButtonMapping{binding.alternate, kControllerButtons[i].padButton});
         }
     }
+}
+
+using ControllerNames::kClassicButtons;
+
+// A Wii Remote row's Classic Controller layout: its [controller.wiiN] keys, else by position.
+ControllerNames::ClassicBindings ConfiguredClassicBindings(uint32_t port, bool log) {
+    ControllerNames::ClassicBindings bindings{};
+    for (size_t i = 0; i < kClassicButtons.size(); ++i) {
+        bindings[i] = {kClassicButtons[i].nativeButton, PAD_NATIVE_BUTTON_INVALID};
+        if (const auto configured = RuntimeConfigFile::ControllerRowButton(port, kClassicButtons[i].configKey)) {
+            const ConfiguredBinding binding = ParseBinding(*configured, kClassicButtons[i].configKey, log);
+            bindings[i] = {binding.primary.value_or(bindings[i][0]), binding.alternate};
+        }
+    }
+    return bindings;
+}
+
+void WriteClassicBinding(uint32_t port, size_t index, const std::array<uint32_t, 2>& binding) {
+    RuntimeConfigFile::SetControllerRowButton(port, kClassicButtons[index].configKey,
+                                              NativeBindingConfig(binding[0], binding[1]));
+    Wiimote::SetClassicBindings(port - PAD_MAX_CONTROLLERS, ConfiguredClassicBindings(port, false));
 }
 
 bool g_wiiRemotesEnabled = RuntimeConfigFile::WiiRemotesEnabled();
@@ -485,6 +538,14 @@ void CompleteRebind(uint32_t value) {
             g_rebind.active = false;
             return;
         }
+        // On a Wii Remote row the target is a kClassicButtons index.
+        if (capture.port >= PAD_MAX_CONTROLLERS) {
+            auto binding = ConfiguredClassicBindings(capture.port, false)[capture.target];
+            binding[capture.secondary ? 1 : 0] = value;
+            WriteClassicBinding(capture.port, capture.target, binding);
+            g_rebind.active = false;
+            return;
+        }
         if (capture.secondary) PADSetAltButtonMapping(capture.port, {value, capture.target});
         else PADSetButtonMapping(capture.port, {value, capture.target});
         uint32_t count = 0, altCount = 0;
@@ -495,10 +556,10 @@ void CompleteRebind(uint32_t value) {
             if (primary[i].padButton == capture.target) primaryValue = primary[i].nativeButton;
         for (uint32_t i = 0; i < altCount; ++i)
             if (alternate[i].padButton == capture.target) alternateValue = alternate[i].nativeButton;
-        std::string config = NativeBindingConfig(primaryValue);
-        if (alternateValue != PAD_NATIVE_BUTTON_INVALID) config += ',' + NativeBindingConfig(alternateValue);
+        const std::string config = NativeBindingConfig(primaryValue, alternateValue);
         for (size_t i = 0; i < kControllerButtons.size(); ++i)
-            if (kControllerButtons[i].padButton == capture.target) RuntimeConfigFile::SetControllerButton(i, config);
+            if (kControllerButtons[i].padButton == capture.target)
+                RuntimeConfigFile::SetControllerRowButton(capture.port, kControllerButtons[i].configKey, config);
     } else if (capture.kind == RebindKind::MuteHotkey) {
         g_muteHotkey = static_cast<int32_t>(value);
         RuntimeConfigFile::SetMuteHotkey(g_muteHotkey);
@@ -744,6 +805,15 @@ void DrawRumbleSettings() {
     }
 }
 
+// The help line, then the binding buttons' width and the column they start at.
+std::pair<float, float> DrawBindingHeader() {
+    ImGui::TextDisabled("Click a binding, then press the input to use. Triggers: LT/L2, RT/R2.");
+    const float width = ImGui::CalcTextSize("Right shoulder (RB / R1)").x + ImGui::GetFrameHeight() +
+                        ImGui::GetStyle().FramePadding.x * 2.0f;
+    const float x = ImGui::GetCursorPosX() + ImGui::CalcTextSize("D-pad Right").x + ImGui::GetStyle().ItemSpacing.x * 2.0f;
+    return {width, x};
+}
+
 void DrawGamepadMapping(uint32_t port) {
     uint32_t mappingCount = 0;
     PADButtonMapping* mappings = PADGetButtonMappings(port, &mappingCount);
@@ -754,13 +824,9 @@ void DrawGamepadMapping(uint32_t port) {
     uint32_t altMappingCount = 0;
     PADButtonMapping* altMappings = PADGetAltButtonMappings(port, &altMappingCount);
 
-    const auto writeBinding = [](size_t index, uint32_t primaryNative, uint32_t altNative) {
-        std::string value = NativeBindingConfig(primaryNative);
-        if (altNative != PAD_NATIVE_BUTTON_INVALID) {
-            value += ',';
-            value += NativeBindingConfig(altNative);
-        }
-        RuntimeConfigFile::SetControllerButton(index, value);
+    const auto writeBinding = [port](size_t index, uint32_t primaryNative, uint32_t altNative) {
+        RuntimeConfigFile::SetControllerRowButton(port, kControllerButtons[index].configKey,
+                                                  NativeBindingConfig(primaryNative, altNative));
     };
 
     // Which rows show the second-binding button without one being bound yet;
@@ -783,7 +849,8 @@ void DrawGamepadMapping(uint32_t port) {
                     return mapping.padButton == kControllerButtons[i].padButton;
                 });
                 if (it != restored + restoredCount) {
-                    RuntimeConfigFile::SetControllerButton(i, NativeButtonForValue(it->nativeButton).configName);
+                    RuntimeConfigFile::SetControllerRowButton(port, kControllerButtons[i].configKey,
+                                                              NativeButtonForValue(it->nativeButton).configName);
                 }
             }
         }
@@ -797,7 +864,7 @@ void DrawGamepadMapping(uint32_t port) {
                 PADSetButtonMapping(port, PADButtonMapping{native->nativeButton, kControllerButtons[i].padButton});
                 PADSetAltButtonMapping(port,
                                        PADButtonMapping{PAD_NATIVE_BUTTON_INVALID, kControllerButtons[i].padButton});
-                RuntimeConfigFile::SetControllerButton(i, preset[i]);
+                RuntimeConfigFile::SetControllerRowButton(port, kControllerButtons[i].configKey, preset[i]);
             }
         }
         altRowExpanded.fill(false);
@@ -813,11 +880,9 @@ void DrawGamepadMapping(uint32_t port) {
         applyPreset(kPlayStationPreset);
     }
 
-    ImGui::TextDisabled("Click a binding, then press the input to use. Triggers: LT/L2, RT/R2.");
-    const float bindingWidth = ImGui::CalcTextSize("Right shoulder (RB / R1)").x +
-                               ImGui::GetFrameHeight() + ImGui::GetStyle().FramePadding.x * 2.0f;
-    const float bindingX = ImGui::GetCursorPosX() + ImGui::CalcTextSize("D-pad Right").x +
-                           ImGui::GetStyle().ItemSpacing.x * 2.0f;
+    const std::pair<float, float> columns = DrawBindingHeader();
+    const float bindingWidth = columns.first;
+    const float bindingX = columns.second;
     for (size_t i = 0; i < kControllerButtons.size(); ++i) {
         auto mappingIt = std::find_if(mappings, mappings + mappingCount, [&](const PADButtonMapping& mapping) {
             return mapping.padButton == kControllerButtons[i].padButton;
@@ -895,12 +960,50 @@ void DrawGamepadMapping(uint32_t port) {
     }
 }
 
+void DrawClassicMapping(uint32_t port) {
+    const ControllerNames::ClassicBindings bindings = ConfiguredClassicBindings(port, false);
+    ImGui::TextUnformatted("Layout:");
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Default")) {
+        for (size_t i = 0; i < kClassicButtons.size(); ++i) {
+            WriteClassicBinding(port, i, {kClassicButtons[i].nativeButton, PAD_NATIVE_BUTTON_INVALID});
+        }
+    }
+    const std::pair<float, float> columns = DrawBindingHeader();
+    for (size_t i = 0; i < kClassicButtons.size(); ++i) {
+        ImGui::PushID(static_cast<int>(i));
+        const auto drawBinding = [&](size_t which) {
+            const uint32_t native = bindings[i][which];
+            const char* label = native == PAD_NATIVE_BUTTON_INVALID ? "None" : NativeButtonForValue(native).label;
+            const std::string caption = std::string(label) + (which == 0 ? "##primary" : "##alt");
+            if (ImGui::Button(caption.c_str(), ImVec2(columns.first, 0.0f))) {
+                BeginRebind(RebindKind::Controller, static_cast<uint16_t>(i), kClassicButtons[i].label, which == 1);
+            }
+        };
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted(kClassicButtons[i].label);
+        ImGui::SameLine(columns.second);
+        drawBinding(0);
+        ImGui::SameLine();
+        ImGui::TextUnformatted("or");
+        ImGui::SameLine();
+        drawBinding(1);
+        ImGui::PopID();
+    }
+}
+
 std::string ControllerLabel(uint32_t index) {
     const char* name = PADGetNameForControllerIndex(index);
     return name != nullptr ? name : "Unknown controller";
 }
 
-// One row per player: the device combo replaces separate assign/unassign/keyboard controls.
+// A row is the game's GameCube port or Wii Remote channel; which player it plays is join order.
+std::string RowLabel(uint32_t port) {
+    return port < PAD_MAX_CONTROLLERS ? "GameCube " + std::to_string(port + 1)
+                                      : "Wii Remote " + std::to_string(port - PAD_MAX_CONTROLLERS + 1);
+}
+
+// One row per port: the device combo replaces separate assign/unassign/keyboard controls.
 void DrawPlayerRow(uint32_t port) {
     // Ports after the GameCube ones are the Wii Remote slots, where a gamepad plays as a Classic Controller.
     const bool wii = port >= PAD_MAX_CONTROLLERS;
@@ -919,12 +1022,11 @@ void DrawPlayerRow(uint32_t port) {
     }
 
     ImGui::PushID(static_cast<int>(port));
-    const std::string label = "Player " + std::to_string(port + 1);
     ImGui::AlignTextToFramePadding();
-    if (ImGui::RadioButton(label.c_str(), g_controllerPort == static_cast<int>(port))) {
+    if (ImGui::RadioButton(RowLabel(port).c_str(), g_controllerPort == static_cast<int>(port))) {
         g_controllerPort = static_cast<int>(port);
     }
-    ImGui::SameLine(ImGui::CalcTextSize("Player 0").x + ImGui::GetFrameHeight() + 16.0f);
+    ImGui::SameLine(ImGui::CalcTextSize("Wii Remote 0").x + ImGui::GetFrameHeight() + 16.0f);
     ImGui::SetNextItemWidth(-FLT_MIN);
     if (ImGui::BeginCombo("##device", preview.c_str())) {
         g_controllerPort = static_cast<int>(port);
@@ -938,12 +1040,20 @@ void DrawPlayerRow(uint32_t port) {
             std::string item = ControllerLabel(index);
             for (uint32_t other = 0; other < PAD_MAX_ASSIGNABLE_PORTS; ++other) {
                 if (other != port && PADGetIndexForPort(other) == static_cast<s32>(index)) {
-                    item += " (Player " + std::to_string(other + 1) + ")";
+                    item += " (" + RowLabel(other) + ")";
+                    break;
+                }
+            }
+            // Same-named pads (an adapter's four ports) are told apart by holding a button on one.
+            SDL_Gamepad* pad = PADGetSDLGamepadForIndex(index);
+            for (int button = 0; pad != nullptr && button < SDL_GAMEPAD_BUTTON_COUNT; ++button) {
+                if (SDL_GetGamepadButton(pad, static_cast<SDL_GamepadButton>(button))) {
+                    item += "  < pressing";
                     break;
                 }
             }
             ImGui::PushID(static_cast<int>(index));
-            if (ImGui::Selectable(item.c_str(), !keyboard && assigned == static_cast<int32_t>(index))) {
+            if (ImGui::Selectable((item + "###pad").c_str(), !keyboard && assigned == static_cast<int32_t>(index))) {
                 SetKeyboardActive(port, false);
                 PADSetPortForIndex(index, port);
                 g_configuredControllerIndices.fill(std::numeric_limits<int32_t>::min());
@@ -973,7 +1083,7 @@ void DrawControllerSettings() {
     }
 
     const uint32_t port = static_cast<uint32_t>(g_controllerPort);
-    ImGui::SeparatorText(("Player " + std::to_string(port + 1)).c_str());
+    ImGui::SeparatorText(RowLabel(port).c_str());
     const bool wii = port >= PAD_MAX_CONTROLLERS;
     const uint32_t slot = wii ? port - PAD_MAX_CONTROLLERS : port;
     const Wiimote::SlotInfo remote = Wiimote::Slot(slot);
@@ -988,7 +1098,12 @@ void DrawControllerSettings() {
             ImGui::TextDisabled("No device. Pick one in the list above.");
         } else if (!remote.attached) {
             ImGui::TextUnformatted("The game reads it as a Wii Remote with a Classic Controller.");
-            ImGui::TextDisabled("a/b/x/y by position; a Wii Remote on this slot takes over.");
+            ImGui::TextDisabled("A Wii Remote on this slot takes over.");
+            if (!IsWiiUPro(PADGetIndexForPort(port)) && ImGui::CollapsingHeader("Customize buttons")) {
+                ImGui::Indent();
+                DrawClassicMapping(port);
+                ImGui::Unindent();
+            }
         }
     } else if (KeyboardActive(port)) {
         DrawKeyboardSettings(port);
@@ -1544,6 +1659,9 @@ void InitializeRuntimeSettings() noexcept {
     InputBindings::Reload();
     controller_mapping_wizard::LoadPersistedMappings();
     ApplyConfiguredMappings();
+    for (uint32_t port = PAD_MAX_CONTROLLERS; port < PAD_MAX_ASSIGNABLE_PORTS; ++port) {
+        Wiimote::SetClassicBindings(port - PAD_MAX_CONTROLLERS, ConfiguredClassicBindings(port, true));
+    }
     AudioBackend::Instance().SetMasterVolume(static_cast<float>(g_audioVolumePercent) / 100.0f);
     AudioBackend::Instance().SetMuted(g_audioMuted);
     MusicAttenuation::SetMusicVolume(static_cast<float>(g_musicVolumePercent) / 100.0f);

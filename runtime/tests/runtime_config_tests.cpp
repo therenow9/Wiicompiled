@@ -51,6 +51,18 @@ int main() {
         const RuntimeUserConfig config = RuntimeConfigFile::ParseConfig(input, "invalid.toml");
         if (!Require(!config.metalFxSpatialUpscaling, "invalid MetalFX setting was accepted")) return 1;
     }
+    {
+        std::istringstream input("[controller]\na = \"south\"\n\n[controller.gamecube2]\na = \"east,left_shoulder\"\n\n"
+                                 "[controller.wii4]\nzl = \"left_trigger@30\"\n\n[controller.wii_accel_offsets]\nx = 0.1\n"
+                                 "\n[controller.player1]\na = \"west\"\n");
+        const RuntimeUserConfig config = RuntimeConfigFile::ParseConfig(input, "rows.toml");
+        if (!Require(config.controllerButtons[0] == std::optional<std::string>{"south"} &&
+                         config.controllerRowButtons[0].empty() &&
+                         config.controllerRowButtons[1].at("a") == "east,left_shoulder" &&
+                         config.controllerRowButtons[7].at("zl") == "left_trigger@30" &&
+                         config.controllerRowButtons[7].size() == 1,
+                     "per-row controller bindings were not loaded")) return 1;
+    }
     if (!SetsFps("[video]\nshow_fps = false\n", "bare key was not replaced")) return 1;
     if (!SetsFps("[video]\n\"show_fps\" = false\n", "basic-quoted key was not replaced")) return 1;
     if (!SetsFps("[video]\n'show_fps'=false\n", "literal-quoted key was not replaced")) return 1;

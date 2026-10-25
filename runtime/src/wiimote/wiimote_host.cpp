@@ -773,14 +773,24 @@ size_t Manager::Waiting() {
 bool g_enabled = false;
 
 // The gamepad on the player index after the GameCube ports, read as a Classic
-// Controller: a/b/x/y by position, as on a real one. The Bluetooth tick may run inside
+// Controller through its row's layout. The Bluetooth tick may run inside
 // Aurora's frame wait, which must not enter Aurora, so it reads what Sample() last took.
 class PadClassics final : public GamepadSource {
 public:
+    void SetBindings(size_t slot, const ControllerNames::ClassicBindings& bindings) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_bindings[slot] = bindings;
+    }
+
     void Sample() {
+        std::array<ControllerNames::ClassicBindings, Bluetooth::kRemoteSlots> bindings;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            bindings = m_bindings;
+        }
         std::array<ClassicState, Bluetooth::kRemoteSlots> states{};
         std::array<bool, Bluetooth::kRemoteSlots> present{};
-        for (size_t slot = 0; slot < Bluetooth::kRemoteSlots; ++slot) present[slot] = Poll(slot, states[slot]);
+        for (size_t slot = 0; slot < Bluetooth::kRemoteSlots; ++slot) present[slot] = Poll(slot, states[slot], bindings[slot]);
         std::array<bool, Bluetooth::kRemoteSlots> rumble{};
         {
             std::lock_guard<std::mutex> lock(m_mutex);
@@ -814,7 +824,7 @@ public:
     }
 
 private:
-    static bool Poll(size_t slot, ClassicState& state) {
+    static bool Poll(size_t slot, ClassicState& state, const ControllerNames::ClassicBindings& bindings) {
         const s32 index = PADGetIndexForPort(static_cast<u32>(PAD_MAX_CONTROLLERS + slot));
         SDL_Gamepad* gamepad = index < 0 ? nullptr : PADGetSDLGamepadForIndex(static_cast<u32>(index));
         if (gamepad == nullptr) return false;
@@ -825,29 +835,27 @@ private:
         SDL_Joystick* raw = name != nullptr && std::strstr(name, "Wii U Pro Controller") != nullptr
                                 ? SDL_GetGamepadJoystick(gamepad)
                                 : nullptr;
-        const auto button = [&](SDL_GamepadButton sdl, uint16_t classic) {
-            if (raw != nullptr ? SDL_GetJoystickButton(raw, sdl) : SDL_GetGamepadButton(gamepad, sdl)) {
-                state.buttons |= classic;
-            }
-        };
-        button(SDL_GAMEPAD_BUTTON_EAST, ClassicButton::A);
-        button(SDL_GAMEPAD_BUTTON_SOUTH, ClassicButton::B);
-        button(SDL_GAMEPAD_BUTTON_NORTH, ClassicButton::X);
-        button(SDL_GAMEPAD_BUTTON_WEST, ClassicButton::Y);
-        button(SDL_GAMEPAD_BUTTON_START, ClassicButton::Plus);
-        button(SDL_GAMEPAD_BUTTON_BACK, ClassicButton::Minus);
-        button(SDL_GAMEPAD_BUTTON_GUIDE, ClassicButton::Home);
-        button(SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, ClassicButton::L);
-        button(SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, ClassicButton::R);
-        button(SDL_GAMEPAD_BUTTON_DPAD_UP, ClassicButton::Up);
-        button(SDL_GAMEPAD_BUTTON_DPAD_DOWN, ClassicButton::Down);
-        button(SDL_GAMEPAD_BUTTON_DPAD_LEFT, ClassicButton::Left);
-        button(SDL_GAMEPAD_BUTTON_DPAD_RIGHT, ClassicButton::Right);
         const auto axis = [&](SDL_GamepadAxis sdl) {
             return std::clamp(static_cast<float>(SDL_GetGamepadAxis(gamepad, sdl)) / 32767.0f, -1.0f, 1.0f);
         };
-        if (axis(SDL_GAMEPAD_AXIS_LEFT_TRIGGER) >= 0.5f) state.buttons |= ClassicButton::ZL;
-        if (axis(SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) >= 0.5f) state.buttons |= ClassicButton::ZR;
+        // A binding is an SDL button, or an axis pushed past its threshold (PADEncodeAxisButton).
+        const auto pressed = [&](uint32_t native) {
+            if (PADIsAxisButton(native)) {
+                const float value = axis(static_cast<SDL_GamepadAxis>(PADAxisButtonAxis(native)));
+                return (PADAxisButtonNegative(native) ? -value : value) * 100.0f >=
+                       static_cast<float>(PADAxisButtonThreshold(native));
+            }
+            if (native >= SDL_GAMEPAD_BUTTON_COUNT) return false;
+            const auto sdl = static_cast<SDL_GamepadButton>(native);
+            return raw != nullptr ? SDL_GetJoystickButton(raw, sdl) : SDL_GetGamepadButton(gamepad, sdl);
+        };
+        // A Wii U Pro keeps the layout by position: its raw buttons are not what F10 captures.
+        for (size_t i = 0; i < bindings.size(); ++i) {
+            const auto& button = ControllerNames::kClassicButtons[i];
+            if (raw != nullptr ? pressed(button.nativeButton) : pressed(bindings[i][0]) || pressed(bindings[i][1])) {
+                state.buttons |= button.classicButton;
+            }
+        }
         state.leftX = axis(SDL_GAMEPAD_AXIS_LEFTX);
         state.leftY = -axis(SDL_GAMEPAD_AXIS_LEFTY);
         state.rightX = axis(SDL_GAMEPAD_AXIS_RIGHTX);
@@ -859,6 +867,7 @@ private:
     }
 
     std::mutex m_mutex;
+    std::array<ControllerNames::ClassicBindings, Bluetooth::kRemoteSlots> m_bindings{};
     std::array<ClassicState, Bluetooth::kRemoteSlots> m_states{};
     std::array<bool, Bluetooth::kRemoteSlots> m_present{};
     std::array<bool, Bluetooth::kRemoteSlots> m_rumble{};
@@ -909,6 +918,12 @@ Bluetooth::RemoteHost& HostWithGamepads() {
 
 void SampleGamepads() {
     Gamepads().Sample();
+}
+
+void SetClassicBindings(size_t slot, const ControllerNames::ClassicBindings& bindings) {
+    if (slot < Bluetooth::kRemoteSlots) {
+        Gamepads().SetBindings(slot, bindings);
+    }
 }
 
 SlotInfo Slot(size_t slot) {
