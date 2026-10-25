@@ -26,7 +26,8 @@ public sealed record RuntimeNativeEffectEntry(
 /// <summary>
 /// One process-local view of the runtime's native registrations and their guest
 /// ABI contracts. C++ remains the only source of truth: the translator builds
-/// this index once, shares it across all consumers, and writes nothing to disk.
+/// this index once and shares it across all consumers. Only emit-native-index
+/// persists it (<see cref="RuntimeNativeIndexFile"/>).
 /// </summary>
 public sealed record RuntimeNativeIndex(
     RuntimeNativeRegistration[] Registrations,
@@ -42,6 +43,22 @@ public sealed record RuntimeNativeIndex(
             .Select(static entry => entry.Address).ToHashSet();
         return new RuntimeNativeGuestEffectSet(contracts, precise, conservative);
     }
+
+    /// <summary>
+    /// The index is keyed by the PAL addresses the runtime sources name; this is the same index
+    /// keyed by <paramref name="region"/>'s addresses. Every address must have a counterpart in that region.
+    /// </summary>
+    public RuntimeNativeIndex ForRegion(GuestAddressTable table, GuestRegion region) => new(
+        Registrations.Select(entry => entry with { Address = table.Map(entry.Address, region) }).ToArray(),
+        VoidStubAbis.Select(entry => entry with { Address = table.Map(entry.Address, region) }).ToArray(),
+        Effects.Select(entry => entry with
+        {
+            Address = table.Map(entry.Address, region),
+            Contract = entry.Contract with
+            {
+                DirectCallTargets = entry.Contract.DirectCallTargets.Select(target => table.Map(target, region)).ToArray()
+            }
+        }).ToArray());
 }
 
 public static class RuntimeNativeIndexBuilder
@@ -67,6 +84,31 @@ public static class RuntimeNativeIndexBuilder
                 .Select(item => new RuntimeNativeEffectEntry(
                     item.Key, item.Value, effects.PreciseContracts.Contains(item.Key)))
                 .ToArray());
+    }
+
+    /// <summary>
+    /// The index for <paramref name="nativeSourceDirectory"/>: the serialized index at
+    /// <paramref name="indexPath"/> when it matches the sources (or the sources are absent),
+    /// otherwise a fresh scan.
+    /// </summary>
+    public static RuntimeNativeIndex Resolve(
+        string nativeSourceDirectory, string? indexPath, TextWriter? diagnostics = null)
+    {
+        var sourceRoot = Path.GetFullPath(nativeSourceDirectory);
+        if (string.IsNullOrWhiteSpace(indexPath) || !File.Exists(indexPath))
+            return Build(sourceRoot);
+
+        var expectedDigest = Directory.Exists(sourceRoot)
+            ? RuntimeNativeIndexFile.ComputeSourceDigest(sourceRoot)
+            : null;
+        if (RuntimeNativeIndexFile.TryLoad(indexPath, expectedDigest, out var index, out var reason))
+            return index;
+        if (expectedDigest is null)
+            throw new InvalidOperationException(
+                $"The native index {indexPath} is unusable ({reason}) and the native sources it describes are missing: {sourceRoot}");
+
+        diagnostics?.WriteLine($"[translator] ignoring native index {indexPath} ({reason}); scanning {sourceRoot}");
+        return Build(sourceRoot);
     }
 
     private static IEnumerable<RuntimeNativeRegistration> ScanRegistrations(
@@ -95,7 +137,9 @@ public static class RuntimeNativeIndexBuilder
             .Distinct()
             .OrderBy(static registration => registration.Address)
             .ThenBy(static registration => registration.Symbol, StringComparer.Ordinal)
-            .ThenBy(static registration => registration.SourceFile, StringComparer.Ordinal);
+            .ThenBy(static registration => registration.SourceFile, StringComparer.Ordinal)
+            .ThenBy(static registration => registration.IsTranslatedOverride)
+            .ThenBy(static registration => registration.ExcludesBaseTranslation);
     }
 
     private static uint ParseAddress(string value) => GuestTargetParser.ParseHexAddress(value);

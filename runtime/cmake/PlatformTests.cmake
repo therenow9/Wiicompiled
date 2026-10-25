@@ -63,11 +63,26 @@ target_include_directories(mkw_input_expr_tests PRIVATE "${MKW_TEST_RUNTIME_DIR}
 target_compile_features(mkw_input_expr_tests PRIVATE cxx_std_17)
 add_test(NAME mkw_input_expr_tests COMMAND mkw_input_expr_tests)
 
-# Which controller serves a Wii channel is decided in the header, without SDL.
-add_executable(mkw_wii_channel_tests "${MKW_TEST_RUNTIME_DIR}/tests/wii_channel_tests.cpp")
-target_include_directories(mkw_wii_channel_tests PRIVATE "${MKW_TEST_RUNTIME_DIR}/include")
-target_compile_features(mkw_wii_channel_tests PRIVATE cxx_std_17)
-add_test(NAME mkw_wii_channel_tests COMMAND mkw_wii_channel_tests)
+# The emulated Bluetooth controller is pure host code.
+add_executable(mkw_bluetooth_controller_tests
+    "${MKW_TEST_RUNTIME_DIR}/tests/bluetooth_controller_tests.cpp"
+    "${MKW_TEST_RUNTIME_DIR}/src/hle/bluetooth/bt_controller.cpp"
+    "${MKW_TEST_RUNTIME_DIR}/src/hle/bluetooth/bt_remote_link.cpp"
+    "${MKW_TEST_RUNTIME_DIR}/src/hle/bluetooth/bt_sdp.cpp")
+target_include_directories(mkw_bluetooth_controller_tests PRIVATE "${MKW_TEST_RUNTIME_DIR}/include")
+target_compile_features(mkw_bluetooth_controller_tests PRIVATE cxx_std_20)
+add_test(NAME mkw_bluetooth_controller_tests COMMAND mkw_bluetooth_controller_tests)
+
+add_executable(mkw_gamepad_remote_tests
+    "${MKW_TEST_RUNTIME_DIR}/tests/gamepad_remote_tests.cpp"
+    "${MKW_TEST_RUNTIME_DIR}/src/wiimote/gamepad_remote.cpp"
+    "${MKW_TEST_RUNTIME_DIR}/src/wiimote/wiimote_ext_crypto.cpp"
+    "${MKW_TEST_RUNTIME_DIR}/src/hle/bluetooth/bt_controller.cpp"
+    "${MKW_TEST_RUNTIME_DIR}/src/hle/bluetooth/bt_remote_link.cpp"
+    "${MKW_TEST_RUNTIME_DIR}/src/hle/bluetooth/bt_sdp.cpp")
+target_include_directories(mkw_gamepad_remote_tests PRIVATE "${MKW_TEST_RUNTIME_DIR}/include")
+target_compile_features(mkw_gamepad_remote_tests PRIVATE cxx_std_20)
+add_test(NAME mkw_gamepad_remote_tests COMMAND mkw_gamepad_remote_tests)
 
 # HostContext deliberately keeps the platform-specific context primitive out
 # of fiber_manager.cpp. Exercise the Linux libco handoff directly so future

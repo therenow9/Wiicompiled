@@ -93,7 +93,7 @@ function Get-MkwBuildSafePath([string]$Path, [string]$Kind, [string]$MarkerFile)
 
 function Get-MkwProjectPins([string]$ProjectFile) {
     <#
-    The Mario Kart Wii facts pinned by projects/mkwii/recomp.yml (game identity, clean input
+    The Mario Kart Wii facts pinned by a projects/*/recomp.yml (game identity, clean input
     digests, translation entry point, Retro-WFC endpoint), read from one place instead of being
     restated; Test-PinnedFacts.ps1 checks the copies that can't read YAML (C++ header, C#
     constants) against these values. Parsing is literal, not a YAML dependency, since the file is
@@ -101,7 +101,7 @@ function Get-MkwProjectPins([string]$ProjectFile) {
     #>
     Assert-File $ProjectFile 'Translation project file'
     $pins = [ordered]@{
-        GameId = ''; DolSha256 = ''; RelSha256 = ''; EntryPoint = ''; RetroWfcPayloadUri = ''
+        GameId = ''; Region = ''; DolSha256 = ''; RelSha256 = ''; EntryPoint = ''; RetroWfcPayloadUri = ''
     }
     $section = ''
     $inputKey = ''
@@ -112,6 +112,8 @@ function Get-MkwProjectPins([string]$ProjectFile) {
         if ($section -eq 'inputs' -and $line -match '^\s{2}([A-Za-z0-9_]+):\s*$') { $inputKey = $Matches[1]; continue }
         if ($section -eq 'project' -and $line -match '^\s*game_id:\s*(\S+)\s*$') {
             $pins.GameId = $Matches[1]
+        } elseif ($section -eq 'project' -and $line -match '^\s*region:\s*(\S+)\s*$') {
+            $pins.Region = $Matches[1]
         } elseif ($section -eq 'inputs' -and $line -match '^\s*sha256:\s*([0-9a-fA-F]{64})\s*$') {
             if ($inputKey -eq 'dol') { $pins.DolSha256 = $Matches[1].ToLowerInvariant() }
             elseif ($inputKey -eq 'rel') { $pins.RelSha256 = $Matches[1].ToLowerInvariant() }
@@ -130,8 +132,33 @@ function Get-MkwProjectPins([string]$ProjectFile) {
     return $pins
 }
 
+function Resolve-MkwProjectForAssets([string]$Workspace, [string]$AssetsDirectory) {
+    <#
+    The translation project pinned to the main.dol in AssetsDirectory, after checking that
+    StaticR.rel and any extracted disc data belong to the same release.
+    #>
+    $dolSha = Get-MkwFileSha256 (Join-Path $AssetsDirectory 'main.dol')
+    foreach ($file in Get-ChildItem -LiteralPath (Join-Path $Workspace 'projects') -Filter 'recomp.yml' -Recurse -File) {
+        $pins = Get-MkwProjectPins $file.FullName
+        if ($pins.DolSha256 -ne $dolSha) { continue }
+        if ((Get-MkwFileSha256 (Join-Path $AssetsDirectory 'StaticR.rel')) -ne $pins.RelSha256) {
+            throw "StaticR.rel does not match the clean $($pins.GameId) release of main.dol."
+        }
+        $bootBin = Join-Path $AssetsDirectory 'DATA\sys\boot.bin'
+        if (Test-Path -LiteralPath $bootBin -PathType Leaf) {
+            $discId = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($bootBin), 0, 6)
+            if ($discId -ne $pins.GameId) {
+                throw "The extracted game data is $discId but main.dol is $($pins.GameId); extract the game again."
+            }
+        }
+        return [pscustomobject]@{ Path = $file.FullName; Pins = $pins }
+    }
+    throw "main.dol (sha256 $dolSha) is not a supported clean Mario Kart Wii release."
+}
+
 function Invoke-Checked([string]$FilePath, [string[]]$Arguments, [string]$Description,
-    [string]$LogPrefix = 'MKWCBUILD', [string]$StepId = '', [bool]$WaitForProcessTree = $true) {
+    [string]$LogPrefix = 'MKWCBUILD', [string]$StepId = '', [bool]$WaitForProcessTree = $true,
+    [int]$TimeoutSeconds = 0) {
     <#
     Runs a build tool and turns a non-zero exit code into a described failure. By default,
     Start-Process -Wait waits for the whole process tree, since a .NET single-file bundle host may
@@ -140,20 +167,39 @@ function Invoke-Checked([string]$FilePath, [string[]]$Arguments, [string]$Descri
     Start-Process doesn't publish $LASTEXITCODE, so this sets it manually for callers that check it.
     -StepId emits the machine-readable form the installer's progress bar consumes (BuildStepIds in
     WiiCompiled.Setup/InstallProgress.cs); the human sentence stays on the same log line.
+    -TimeoutSeconds waits on the process itself and kills its tree when time runs out.
     #>
     if ($StepId) { Write-Host "${LogPrefix}:STEP:${StepId} $Description" }
     else { Write-Host "${LogPrefix}: $Description" }
     $quotedArguments = @($Arguments | ForEach-Object {
         if ($_.Contains('"')) { throw "A native build argument contains an unsupported quote: $_" }
-        '"' + $_ + '"'
+        # Backslashes directly before the closing quote would otherwise escape it.
+        '"' + ($_ -replace '(\\+)$', '$1$1') + '"'
     })
-    if ($WaitForProcessTree) {
+    if ($TimeoutSeconds -gt 0) {
+        $process = Start-Process -FilePath $FilePath -ArgumentList $quotedArguments -NoNewWindow -PassThru
+        # Holding the handle keeps ExitCode readable once the process has exited.
+        $null = $process.Handle
+        if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+            # taskkill's stderr would end the script under 'Stop' before the message below.
+            try { & taskkill.exe /T /F /PID $process.Id 2>&1 | Out-Null } catch {}
+            throw "$Description did not finish within $TimeoutSeconds seconds and was stopped."
+        }
+        $exitCode = $process.ExitCode
+    } elseif ($WaitForProcessTree) {
         $process = Start-Process -FilePath $FilePath -ArgumentList $quotedArguments `
             -NoNewWindow -Wait -PassThru
         $exitCode = $process.ExitCode
     } else {
-        & $FilePath @Arguments
-        $exitCode = $LASTEXITCODE
+        # Tools report progress on stderr (CMake message()); only the exit code decides failure.
+        $previousPreference = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            & $FilePath @Arguments
+            $exitCode = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $previousPreference
+        }
     }
     $global:LASTEXITCODE = $exitCode
     if ($exitCode -ne 0) { throw "$Description failed with exit code $exitCode." }
@@ -202,19 +248,28 @@ function Get-MkwDawnRuntimeSha256([string]$DependenciesDirectory) {
     return Get-MkwFileSha256 $runtime
 }
 
+function Get-MkwFilesInOrdinalOrder([IO.FileInfo[]]$Files, [string]$Root) {
+    # By relative path, ordinal: Sort-Object compares by culture, which Windows PowerShell (NLS) and
+    # PowerShell 7 (ICU) order differently, so a fingerprint recorded by one never matched the other.
+    $keys = [string[]]@($Files | ForEach-Object { $_.FullName.Substring($Root.Length + 1).Replace('\', '/') })
+    $sorted = [IO.FileInfo[]]@($Files)
+    [Array]::Sort($keys, $sorted, [StringComparer]::Ordinal)
+    return ,$sorted
+}
+
 function Get-MkwThirdPartySourceFingerprint([string]$ThirdPartyDirectory) {
     <#
     SHA-256 over runtime/third_party, the vendored sources behind the prebuilt package. The
     precompiled Crypto++ archive is linked while first-party TUs compile against the same headers,
     so a workspace whose vendored tree moved on must not consume archives harvested from an older
-    one (same reasoning as the aurora fingerprint below). Unlike that scan this hashes hidden files
-    too, since Build-Installer stages this tree with Copy-Item -Force. Returns '' when absent.
+    one (same reasoning as the aurora fingerprint below), skipping dot-paths by name the same way.
+    Returns '' when absent.
     #>
     if ([string]::IsNullOrWhiteSpace($ThirdPartyDirectory)) { return '' }
     if (-not (Test-Path -LiteralPath $ThirdPartyDirectory -PathType Container)) { return '' }
     $root = [IO.Path]::GetFullPath($ThirdPartyDirectory).TrimEnd('\')
-    $files = Get-ChildItem -LiteralPath $root -Recurse -File |
-        Sort-Object { $_.FullName.Substring($root.Length + 1).Replace('\', '/') }
+    $files = Get-MkwFilesInOrdinalOrder @(Get-ChildItem -LiteralPath $root -Recurse -File -Force |
+        Where-Object { -not ($_.FullName.Substring($root.Length + 1) -split '\\' | Where-Object { $_.StartsWith('.') }) }) $root
     $sha = [Security.Cryptography.SHA256]::Create()
     try {
         $builder = [Text.StringBuilder]::new()
@@ -244,15 +299,14 @@ function Get-MkwAuroraSourceFingerprint([string]$AuroraDirectory) {
         (Join-Path $root 'extern') + '\',
         (Join-Path $root 'build') + '\'
     )
-    # Hidden files are skipped deliberately: Build-Installer.ps1 stages this tree
-    # with Copy-Item -Recurse (no -Force), so they never reach the payload and
-    # hashing them would make the two sides disagree by construction.
-    $files = Get-ChildItem -LiteralPath $root -Recurse -File |
+    # Dot-paths (the submodule's .git pointer) are skipped by name, not by the hidden attribute:
+    # the payload zip drops that attribute, so the installed side would otherwise hash them.
+    $files = Get-MkwFilesInOrdinalOrder @(Get-ChildItem -LiteralPath $root -Recurse -File -Force |
         Where-Object {
             $full = $_.FullName
-            -not ($excludedPrefixes | Where-Object { $full.StartsWith($_, [StringComparison]::OrdinalIgnoreCase) })
-        } |
-        Sort-Object { $_.FullName.Substring($root.Length + 1).Replace('\', '/') }
+            -not ($excludedPrefixes | Where-Object { $full.StartsWith($_, [StringComparison]::OrdinalIgnoreCase) }) -and
+            -not ($full.Substring($root.Length + 1) -split '\\' | Where-Object { $_.StartsWith('.') })
+        }) $root
     $sha = [Security.Cryptography.SHA256]::Create()
     try {
         $builder = [Text.StringBuilder]::new()

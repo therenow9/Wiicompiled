@@ -15,10 +15,12 @@
 #include <SDL3/SDL_gamepad.h>
 #include <dolphin/pad.h>
 
+#include "gamepad_remote.h"
+
 namespace ControllerNames {
 
 // A GameCube button as the game sees it, with the Config.toml key that selects
-// it. Order matches RuntimeConfigFile::kControllerButtonKeys.
+// it. Order matches ParseConfigDocument's buttonKeys.
 struct GameCubeButtonItem {
     const char* configKey;
     const char* label;
@@ -39,6 +41,36 @@ inline constexpr std::array<GameCubeButtonItem, PAD_BUTTON_COUNT> kGameCubeButto
     {"left", "D-pad Left", PAD_BUTTON_LEFT},
     {"right", "D-pad Right", PAD_BUTTON_RIGHT},
 }};
+
+// A Classic Controller button as the game sees it from a gamepad on a Wii Remote row, with its
+// [controller.wiiN] key and the input it takes by default: a/b/x/y by position, as on a real one.
+struct ClassicButtonItem {
+    const char* configKey;
+    const char* label;
+    uint16_t classicButton;
+    uint32_t nativeButton;
+};
+
+inline constexpr std::array<ClassicButtonItem, 15> kClassicButtons = {{
+    {"a", "A", Wiimote::ClassicButton::A, SDL_GAMEPAD_BUTTON_EAST},
+    {"b", "B", Wiimote::ClassicButton::B, SDL_GAMEPAD_BUTTON_SOUTH},
+    {"x", "X", Wiimote::ClassicButton::X, SDL_GAMEPAD_BUTTON_NORTH},
+    {"y", "Y", Wiimote::ClassicButton::Y, SDL_GAMEPAD_BUTTON_WEST},
+    {"plus", "+", Wiimote::ClassicButton::Plus, SDL_GAMEPAD_BUTTON_START},
+    {"minus", "-", Wiimote::ClassicButton::Minus, SDL_GAMEPAD_BUTTON_BACK},
+    {"home", "Home", Wiimote::ClassicButton::Home, SDL_GAMEPAD_BUTTON_GUIDE},
+    {"l", "L", Wiimote::ClassicButton::L, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER},
+    {"r", "R", Wiimote::ClassicButton::R, SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER},
+    {"zl", "ZL", Wiimote::ClassicButton::ZL, PADEncodeAxisButton(SDL_GAMEPAD_AXIS_LEFT_TRIGGER, false)},
+    {"zr", "ZR", Wiimote::ClassicButton::ZR, PADEncodeAxisButton(SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, false)},
+    {"up", "D-pad Up", Wiimote::ClassicButton::Up, SDL_GAMEPAD_BUTTON_DPAD_UP},
+    {"down", "D-pad Down", Wiimote::ClassicButton::Down, SDL_GAMEPAD_BUTTON_DPAD_DOWN},
+    {"left", "D-pad Left", Wiimote::ClassicButton::Left, SDL_GAMEPAD_BUTTON_DPAD_LEFT},
+    {"right", "D-pad Right", Wiimote::ClassicButton::Right, SDL_GAMEPAD_BUTTON_DPAD_RIGHT},
+}};
+
+// Each Classic button's primary and alternate native input, indexed like kClassicButtons.
+using ClassicBindings = std::array<std::array<uint32_t, 2>, kClassicButtons.size()>;
 
 // A physical button on the host pad. Names are positional (south/east/...)
 // rather than Xbox-labelled so one config reads the same on any hardware.

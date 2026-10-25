@@ -57,22 +57,25 @@
 #endif
 
 #include "abi_bridge.h"
+#include "audio_backend.h"
+#include "boot_race.h"
+#include "guest_abi/guest_region.h"
 #include "guest_flat_memory.h"
 #include "gx_guest_write.h"
 #include "memory.h"
 #include "system_bridge.h"
 #include "ppc_runtime.h"
 #include "aurora_events.h"
-#include "wii_remote_input.h"
+#include "wiimote_host.h"
 #include "discord_presence.h"
 #include "fiber_manager.h"
+#include "gx_worker.h"
 #include "hle_stubs.h"
 #include "runtime_config.h"
 #include "runtime_log.h"
 #include "runtime_product.h"
 #include "recomp_mod_loader.h"
 #include <aurora/aurora.h>
-#include <SDL3/SDL_video.h>
 #include <aurora/gfx.h>
 #include <dolphin/gx/GXAurora.h>
 #include <dolphin/vi.h>
@@ -89,6 +92,9 @@ namespace {
 std::string FormatHostStackTrace(unsigned framesToSkip = 0);
 
 void ServiceGuestTimingDuringAuroraFrameWait() {
+    if (GxWorker::OnWorker()) {
+        return;
+    }
     // Aurora can block inside FIFO drains before control returns to GX HLE, for as long as a
     // whole display period. Keep VI retraces, alarms and audio moving at wall-clock cadence here
     // while still suppressing guest rescheduling and recursive Aurora work.
@@ -153,6 +159,8 @@ private:
 #endif
 } // namespace
 
+extern const char* const kMkwSetupVersion;
+
 namespace {
 
 std::string g_lastEntryLabel;
@@ -160,6 +168,7 @@ std::atomic_bool g_auroraInitialized{false};
 std::atomic_flag g_abortSignalHandled = ATOMIC_FLAG_INIT;
 std::atomic_bool g_fatalErrorReported{false};
 std::atomic_bool g_fatalPopupShown{false};
+bool g_headless = false;
 std::atomic<int> g_lastExitCode{0};
 std::atomic_bool g_exitCodeSet{false};
 
@@ -379,10 +388,13 @@ void AttachParentConsoleForDiagnostics() {
 void AttachParentConsoleForDiagnostics() {}
 #endif
 
-// The setup writes build-fingerprint.json beside every product executable; its SetupVersion is
-// the only version identity the runtime has (products are compiled locally, so nothing is baked
-// into the binary). Surface it at the top of the transcript so every attached log self-identifies.
+// The macOS and Linux local builds bake the setup version in; the Windows setup instead writes it
+// to build-fingerprint.json beside the executable. Surfaced at the top of the transcript so every
+// attached log self-identifies.
 std::string ReadInstalledSetupVersion() {
+    if (const std::string_view builtIn = kMkwSetupVersion; !builtIn.empty()) {
+        return std::string(builtIn);
+    }
     const auto directory = RuntimeConfigFile::ExecutableDirectory();
     if (!directory) {
         return {};
@@ -626,7 +638,7 @@ std::string FormatHostStackTrace(unsigned framesToSkip) {
         symbol->MaxNameLen = MAX_SYM_NAME;
         if (symbolsReady && SymFromAddr(process, addr, &symbolDisp, symbol)) {
             symbolName = symbol->Name;
-        } else if (auto info = TranslatedFunctionRegistry::FindByHostAddress(static_cast<uintptr_t>(addr))) {
+        } else if (auto info = FindTranslatedFunctionByHostAddress(static_cast<uintptr_t>(addr))) {
             // DbgHelp could not name it; the translated-function registry can.
             translatedFuncName = info->name;
             ppcAddress = info->address;
@@ -688,6 +700,7 @@ void WriteFatalLogImpl(std::string_view reason, std::string_view extraDetails = 
     out << "[runtime] fatal log" << std::endl;
     out << "[runtime] reason: " << reason << std::endl;
     out << "[runtime] timestamp(seconds): " << nowSecs << std::endl;
+    out << "[runtime] game: " << GuestRegion::CurrentFacts().gameId << std::endl;
     out << "[runtime] entry: " << (g_lastEntryLabel.empty() ? "<unknown>" : g_lastEntryLabel) << std::endl;
     if (!extraDetails.empty()) {
         out << "[runtime] details: " << extraDetails << std::endl;
@@ -757,10 +770,12 @@ extern "C" void DumpHostStackTraceForRuntimeHelper() {
 
 void MarkFatalErrorReported() {
     g_fatalErrorReported.store(true, std::memory_order_release);
+    // Every caller exits next; keep the worker out of static teardown.
+    GxWorker::Abandon();
 }
 
 void ShowRuntimeFatalPopup(std::string_view category, std::string_view details) noexcept {
-    if (g_fatalPopupShown.exchange(true, std::memory_order_acq_rel)) {
+    if (g_headless || g_fatalPopupShown.exchange(true, std::memory_order_acq_rel)) {
         return;
     }
 
@@ -1332,12 +1347,25 @@ int RuntimeMain(int argc, char** argv) {
     
     std::string currentEntryLabel;
 
+    // `--headless`: with a boot race, run without a window, sound or dialogs.
+    g_headless = std::any_of(argv + 1, argv + argc,
+                             [](const char* arg) { return std::string_view(arg) == "--headless"; });
+
     try {
-        if (argc != 1) {
-            throw std::invalid_argument("The game runtime does not accept command-line options; use Config.toml through the installed host.");
+        for (int i = 1; i < argc; ++i) {
+            if (std::string_view(argv[i]) != "--headless" && !BootRace::ParseArgument(argv[i])) {
+                throw std::invalid_argument(std::string("Unknown command-line option '") + argv[i] +
+                                            "'; the game runtime only accepts --race[=<course id>], --race-cpu and --headless, use Config.toml through the installed host.");
+            }
+        }
+        if (g_headless && !BootRace::Requested()) {
+            throw std::invalid_argument("--headless needs --race[=<course id>] or --race-cpu");
+        }
+        if (g_headless) {
+            AudioBackend::Instance().SetSilenced(true);
         }
         RuntimeConfigFile::LogLoadedConfig();
-        if (RuntimeConfigFile::DiscordPresenceEnabled()) {
+        if (!g_headless && RuntimeConfigFile::DiscordPresenceEnabled()) {
             DiscordPresence::Initialize(RuntimeConfigFile::DiscordClientId(), "Mario Kart Wii");
         }
         SystemBridge::Initialize();
@@ -1367,21 +1395,6 @@ int RuntimeMain(int argc, char** argv) {
         const std::string auroraCachePath = RuntimeConfigFile::PathToUtf8(rendererCacheDirectory);
         auroraConfig.userPath = auroraUserPath.c_str();
         auroraConfig.cachePath = auroraCachePath.c_str();
-        // An optional window icon a pack can place beside Config.toml: width and height as little-endian
-        // uint32, then RGBA8 pixels. Aurora sets it when it creates the window.
-        static std::vector<uint8_t> windowIcon;
-        if (std::ifstream iconFile{applicationDataDirectory / "window-icon.rgba", std::ios::binary}) {
-            uint32_t iconSize[2] = {};
-            if (iconFile.read(reinterpret_cast<char*>(iconSize), sizeof(iconSize)) && iconSize[0] > 0 &&
-                iconSize[0] <= 1024 && iconSize[1] > 0 && iconSize[1] <= 1024) {
-                windowIcon.resize(size_t{4} * iconSize[0] * iconSize[1]);
-                if (iconFile.read(reinterpret_cast<char*>(windowIcon.data()), static_cast<std::streamsize>(windowIcon.size()))) {
-                    auroraConfig.iconRGBA8 = windowIcon.data();
-                    auroraConfig.iconWidth = iconSize[0];
-                    auroraConfig.iconHeight = iconSize[1];
-                }
-            }
-        }
         auroraConfig.logCallback = &RuntimeAuroraLogCallback;
         auroraConfig.logLevel = LOG_DEBUG;
         const bool configWidescreen = RuntimeConfigFile::WidescreenEnabled(true);
@@ -1392,7 +1405,8 @@ int RuntimeMain(int argc, char** argv) {
         auroraConfig.windowHeight = RuntimeConfigFile::WindowHeight(auroraConfig.windowHeight);
         auroraConfig.hasWindowPosition = RuntimeConfigFile::WindowPosition(
             auroraConfig.windowPosX, auroraConfig.windowPosY);
-        auroraConfig.allowJoystickBackgroundEvents = true;
+        auroraConfig.allowJoystickBackgroundEvents = !g_headless;
+        auroraConfig.startHidden = g_headless;
         auroraConfig.disableCopyFilter = RuntimeConfigFile::DisableCopyFilter(true);
         // Dolphin-style custom textures. Aurora indexes <userPath>/texture_replacements
         // once during aurora_initialize, so both knobs only take effect on the next launch.
@@ -1401,7 +1415,7 @@ int RuntimeMain(int argc, char** argv) {
         auroraConfig.allowTextureReplacements = RuntimeConfigFile::TextureReplacements(false);
         auroraConfig.allowTextureDumps = auroraConfig.allowTextureReplacements &&
                                          RuntimeConfigFile::TextureDumps(false);
-        // No vsync knob: aurora always configures a non-blocking present mode.
+        auroraConfig.vsync = RuntimeConfigFile::Vsync();
         auroraConfig.desiredBackend = BACKEND_AUTO;
         const float resolutionMultiplier = RuntimeConfigFile::ResolutionMultiplier(1.0f);
         ConfigureMkwDynamicAspect(configWidescreen, forceAspect169,
@@ -1447,10 +1461,9 @@ int RuntimeMain(int argc, char** argv) {
         }
         const AuroraBackend requestedBackend = auroraConfig.desiredBackend;
 
-        // SDL only reads its Wii driver hint when the joystick subsystem starts, which
-        // aurora_initialize does; a Bluetooth Wii Remote paired before launch must be
-        // visible on that first scan.
-        WiiRemoteInput::ConfigureSdlHints(RuntimeConfigFile::WiiRemotesEnabled(true));
+        // SDL reads its device hints when the joystick subsystem starts, which
+        // aurora_initialize does.
+        Wiimote::ConfigureSdlHints(RuntimeConfigFile::WiiRemotesEnabled());
 
         const AuroraInfo auroraInfo = aurora_initialize(0, nullptr, &auroraConfig);
         if (auroraInfo.initializationStatus != AURORA_INITIALIZATION_SUCCESS) {
@@ -1466,29 +1479,15 @@ int RuntimeMain(int argc, char** argv) {
             RT_LOG(RT_TAG_RUNTIME) << "graphics backend: " << backendDisplayName(auroraInfo.backend)
                       << std::endl;
         }
-#if defined(_WIN32)
-        // The taskbar keeps the generic icon, apparently because it asks while the game is still loading. A different
-        // icon handle once the window has answered messages for a few seconds makes it ask again.
-        if (auroraConfig.iconRGBA8 != nullptr) {
-            const HWND hwnd = static_cast<HWND>(SDL_GetPointerProperty(SDL_GetWindowProperties(auroraInfo.window), SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr));
-            if (const HICON hicon = hwnd != nullptr ? CopyIcon(reinterpret_cast<HICON>(SendMessageW(hwnd, WM_GETICON, ICON_BIG, 0))) : nullptr) {
-                std::thread([hwnd, hicon] {
-                    for (int answered = 0, tries = 0; answered < 3 && tries < 120; ++tries) {
-                        DWORD_PTR result = 0;
-                        answered = SendMessageTimeoutW(hwnd, WM_NULL, 0, 0, SMTO_ABORTIFHUNG, 250, &result) != 0 ? answered + 1 : 0;
-                        Sleep(1000);
-                    }
-                    PostMessageW(hwnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(hicon));
-                    PostMessageW(hwnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(hicon));
-                }).detach();
-            }
-        }
-#endif
         aurora_set_frame_worker_wait_callback(ServiceGuestTimingDuringAuroraFrameWait);
+        Wiimote::Initialize();
         GxGuestWrite::InstallAuroraHooks();
         UpdateMkwDynamicAspectSurface(auroraInfo.windowSize.native_fb_width,
                                       auroraInfo.windowSize.native_fb_height);
         settings_overlay::InitializeRuntimeSettings();
+        if (BootRace::Requested()) {
+            aurora_set_skip_unready_pipelines(false);
+        }
         RT_LOG(RT_TAG_CONFIG) << "video.widescreen=" << (configWidescreen ? "true" : "false")
                   << " force_16_9=" << (forceAspect169 ? "true" : "false")
                   << " SCGetAspectRatio=" << (configWidescreen || forceAspect169 ? 1 : 0)
@@ -1501,6 +1500,8 @@ int RuntimeMain(int argc, char** argv) {
                   << (forceAspect169 ? "16:9" : (configWidescreen ? "surface (dynamic EGG canvas)" : "4:3"))
                   << std::endl;
         g_auroraInitialized.store(true, std::memory_order_release);
+        GxWorker::SetWaitCallback(ServiceGuestTimingDuringAuroraFrameWait);
+        GxWorker::Start();
 
         auto entry = ResolveEntry();
         InitializePersistentCpuContext();
@@ -1528,6 +1529,8 @@ int RuntimeMain(int argc, char** argv) {
         // Shutdown fiber system
         Fiber::GuestFiberManager::Shutdown();
         WindowPlacementPersistence::Flush(true);
+        Wiimote::Shutdown();
+        GxWorker::Stop();
         aurora_shutdown();
         DiscordPresence::Shutdown();
         SetRuntimeExitCodeImpl(0);
@@ -1546,6 +1549,8 @@ int RuntimeMain(int argc, char** argv) {
         SetRuntimeExitCodeImpl(1);
         Fiber::GuestFiberManager::Shutdown();
         WindowPlacementPersistence::Flush(true);
+        Wiimote::Shutdown();
+        GxWorker::Stop();
         aurora_shutdown();
         DiscordPresence::Shutdown();
         ShutdownProcessTranscript();
@@ -1558,6 +1563,8 @@ int RuntimeMain(int argc, char** argv) {
         SetRuntimeExitCodeImpl(1);
         Fiber::GuestFiberManager::Shutdown();
         WindowPlacementPersistence::Flush(true);
+        Wiimote::Shutdown();
+        GxWorker::Stop();
         aurora_shutdown();
         DiscordPresence::Shutdown();
         ShutdownProcessTranscript();
