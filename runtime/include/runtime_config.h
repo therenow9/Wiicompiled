@@ -842,8 +842,9 @@ inline bool WiiRemotesEnabled(bool fallback = true) {
 }
 
 inline bool SetWiiRemotesEnabled(bool value) {
+    if (!WriteSetting("controller", "wii_remotes", value ? "true" : "false")) return false;
     Mutable().wiiRemotes = value;
-    return WriteSetting("controller", "wii_remotes", value ? "true" : "false");
+    return true;
 }
 
 // Off by default: the search, repeated while no remote is connected, can stutter other Bluetooth devices.
