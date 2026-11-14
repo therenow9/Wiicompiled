@@ -64,6 +64,7 @@ done
 macos_arch=$(uname -m)
 case "$macos_arch" in arm64|x86_64) ;; *) fail "unsupported macOS architecture: $macos_arch" ;; esac
 macos_deployment_target=12.0
+macos_sysroot=$(xcrun --show-sdk-path 2>/dev/null) && [[ -d "$macos_sysroot" ]] || fail 'could not resolve the macOS SDK; install the Xcode Command Line Tools (xcode-select --install)'
 workspace=$(cd "$workspace" && pwd)
 if [[ -z "$setup_version" && -f "$workspace/Launcher/Directory.Build.props" ]]; then
     setup_version=$(sed -nE 's/.*<Version>([^<]+)<\/Version>.*/\1/p' "$workspace/Launcher/Directory.Build.props" | head -n 1)
@@ -186,10 +187,26 @@ fi
 step configure-native 'Configuring the native toolchain'
 # Use Aurora's pinned SDL3 source on macOS.  A system SDL3 can be older than
 # Aurora's required API even when find_package() succeeds.
-"$cmake_bin" -S "$workspace/runtime" -B "$native_build" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER="$cc_bin" -DCMAKE_CXX_COMPILER="$cxx_bin" -DCMAKE_MAKE_PROGRAM="$ninja_bin" -DCMAKE_OSX_ARCHITECTURES="$macos_arch" -DCMAKE_OSX_DEPLOYMENT_TARGET="$macos_deployment_target" -DMKW_TRANSLATED_COMPILE_JOBS="$translated_jobs" -DMKW_X86_CPU_PROFILE="$x86_cpu_profile" -DAURORA_SDL3_PROVIDER=vendor -DMKW_SETUP_VERSION="$setup_version"
+"$cmake_bin" -S "$workspace/runtime" -B "$native_build" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER="$cc_bin" -DCMAKE_CXX_COMPILER="$cxx_bin" -DCMAKE_MAKE_PROGRAM="$ninja_bin" -DCMAKE_OSX_ARCHITECTURES="$macos_arch" -DCMAKE_OSX_DEPLOYMENT_TARGET="$macos_deployment_target" -DCMAKE_OSX_SYSROOT="$macos_sysroot" -DMKW_TRANSLATED_COMPILE_JOBS="$translated_jobs" -DMKW_X86_CPU_PROFILE="$x86_cpu_profile" -DAURORA_SDL3_PROVIDER=vendor -DMKW_SETUP_VERSION="$setup_version"
 mkw_write_identity "$toolchain_provenance" ToolchainFingerprint "$toolchain_fingerprint"
 targets=(); [[ "$profile" != retro-rewind ]] && targets+=(WiiCompiled); [[ "$profile" != base ]] && targets+=(RetroRewind)
 step compile "Compiling ${targets[*]} locally"; "$cmake_bin" --build "$native_build" --target "${targets[@]}" --parallel "$global_jobs"
-if [[ "$profile" != retro-rewind ]]; then "$script_dir/macos/publish-app.command" --build-dir "$native_build" --product WiiCompiled --output-dir "${base_output_dir:-$output_dir}" --architecture "$macos_arch" --minimum-system-version "$macos_deployment_target"; fi
-if (( builds_retro )); then "$script_dir/macos/publish-app.command" --build-dir "$native_build" --product RetroRewind --output-dir "$output_dir" --architecture "$macos_arch" --minimum-system-version "$macos_deployment_target"; fi
+# Same provenance record local-build.sh writes; Wheel Wizard reads CodePulSha256 to tell whether Retro Rewind is current.
+write_build_record() {
+    local code_pul_sha=null
+    [[ "$2" == retro-rewind ]] && code_pul_sha="\"$(mkw_sha256 "$retro_root/Binaries/Code.pul")\""
+    cat > "$1/local-build.json" <<JSON
+{
+  "SchemaVersion": 1,
+  "Profile": "$2",
+  "BuiltUtc": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "DolSha256": "$(mkw_sha256 "$assets/main.dol")",
+  "RelSha256": "$(mkw_sha256 "$assets/StaticR.rel")",
+  "CodePulSha256": $code_pul_sha,
+  "Compiler": "$(clang++ --version | head -1)"
+}
+JSON
+}
+if [[ "$profile" != retro-rewind ]]; then "$script_dir/macos/publish-app.command" --build-dir "$native_build" --product WiiCompiled --output-dir "${base_output_dir:-$output_dir}" --architecture "$macos_arch" --minimum-system-version "$macos_deployment_target"; write_build_record "${base_output_dir:-$output_dir}" base; fi
+if (( builds_retro )); then "$script_dir/macos/publish-app.command" --build-dir "$native_build" --product RetroRewind --output-dir "$output_dir" --architecture "$macos_arch" --minimum-system-version "$macos_deployment_target"; write_build_record "$output_dir" retro-rewind; fi
 printf 'MKWCBUILD:OUTPUT=%s\n' "$output_dir"

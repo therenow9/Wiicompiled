@@ -72,6 +72,72 @@ inline constexpr std::array<ClassicButtonItem, 15> kClassicButtons = {{
 // Each Classic button's primary and alternate native input, indexed like kClassicButtons.
 using ClassicBindings = std::array<std::array<uint32_t, 2>, kClassicButtons.size()>;
 
+// A named layout for both kinds of row, in Config.toml's binding syntax. In the first four one button does
+// the same on both rows (GC Z and Classic ZR look back); the last two keep the Classic layout by position.
+struct ControllerPreset {
+    const char* name;
+    std::array<const char*, kGameCubeButtons.size()> gamecube;
+    std::array<const char*, kClassicButtons.size()> classic;
+};
+
+#define CONTROLLER_PRESET_DPAD "dpad_up", "dpad_down", "dpad_left", "dpad_right"
+// Xbox and PlayStation pads take one layout: A and Cross are both SDL's south.
+inline constexpr std::array<const char*, kGameCubeButtons.size()> kSouthAGameCube = {
+    "south", "east", "west", "north", "start", "right_shoulder", "left_trigger@50", "right_trigger@50",
+    CONTROLLER_PRESET_DPAD};
+inline constexpr std::array<const char*, kClassicButtons.size()> kSouthAClassic = {
+    "south", "east", "west", "north", "start", "back", "guide", "left_trigger@50", "right_trigger@50",
+    "left_shoulder", "right_shoulder", CONTROLLER_PRESET_DPAD};
+inline constexpr std::array<ControllerPreset, 6> kControllerPresets = {{
+    {"Xbox", kSouthAGameCube, kSouthAClassic},
+    {"PlayStation", kSouthAGameCube, kSouthAClassic},
+    {"Nintendo",
+     {"east", "south", "north", "west", "start", "right_shoulder", "left_trigger@50", "right_trigger@50",
+      CONTROLLER_PRESET_DPAD},
+     {"east", "south", "north", "west", "start", "back", "guide", "left_trigger@50", "right_trigger@50",
+      "left_shoulder", "right_shoulder", CONTROLLER_PRESET_DPAD}},
+    // A GameCube controller has no minus: Y, which does nothing in a race, gives it.
+    {"GameCube",
+     {"south", "west", "east", "north", "start", "right_shoulder", "left_trigger@50", "right_trigger@50",
+      CONTROLLER_PRESET_DPAD},
+     {"south", "west", "east", "disabled", "start", "north", "disabled", "left_trigger@50", "right_trigger@50",
+      "disabled", "right_shoulder", CONTROLLER_PRESET_DPAD}},
+    {"Classic Controller Pro",
+     {"east", "south", "north", "west", "start", "back", "left_shoulder", "right_shoulder", CONTROLLER_PRESET_DPAD},
+     {"east", "south", "north", "west", "start", "back", "guide", "left_shoulder", "right_shoulder", "left_trigger",
+      "right_trigger", CONTROLLER_PRESET_DPAD}},
+    {"PlayStation (L1/R1)",
+     {"south", "east", "west", "north", "start", "back", "left_shoulder", "right_shoulder", CONTROLLER_PRESET_DPAD},
+     {"south", "east", "west", "north", "start", "back", "guide", "left_shoulder", "right_shoulder", "left_trigger",
+      "right_trigger", CONTROLLER_PRESET_DPAD}},
+}};
+#undef CONTROLLER_PRESET_DPAD
+
+// The preset an untouched row takes from its controller's type; nullptr keeps that controller's own
+// default. SDL types a Switch Online GameCube controller as GameCube and Linux's Wii U Pro as standard.
+inline const ControllerPreset* AutoPreset(SDL_GamepadType type, uint16_t vendor, uint16_t product) {
+    if (vendor == 0x057e && (product == 0x2073 || product == 0x0330)) {
+        return nullptr;
+    }
+    switch (type) {
+    case SDL_GAMEPAD_TYPE_STANDARD:
+    case SDL_GAMEPAD_TYPE_XBOX360:
+    case SDL_GAMEPAD_TYPE_XBOXONE:
+        return &kControllerPresets[0];
+    case SDL_GAMEPAD_TYPE_PS3:
+    case SDL_GAMEPAD_TYPE_PS4:
+    case SDL_GAMEPAD_TYPE_PS5:
+        return &kControllerPresets[1];
+    case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_PRO:
+    case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_PAIR:
+        return &kControllerPresets[2];
+    case SDL_GAMEPAD_TYPE_GAMECUBE:
+        return &kControllerPresets[3];
+    default:
+        return nullptr;
+    }
+}
+
 // A physical button on the host pad. Names are positional (south/east/...)
 // rather than Xbox-labelled so one config reads the same on any hardware.
 struct NativeButtonItem {

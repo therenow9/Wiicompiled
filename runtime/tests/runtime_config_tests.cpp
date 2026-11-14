@@ -63,6 +63,45 @@ int main() {
                          config.controllerRowButtons[7].size() == 1,
                      "per-row controller bindings were not loaded")) return 1;
     }
+    {
+        std::istringstream input("[video]\nwidescreen = false\nforce_16_9 = true\n");
+        const RuntimeUserConfig config = RuntimeConfigFile::ParseConfig(input, "legacy.toml");
+        if (!Require(config.forceAspect == std::optional<bool>{true} &&
+                         config.widescreen == std::optional<bool>{true} && config.legacyForceAspect,
+                     "legacy force_16_9 did not force a 16:9 game")) return 1;
+    }
+    {
+        std::istringstream input("[video]\nwidescreen = false\nforce_aspect = true\nforce_16_9 = true\n");
+        const RuntimeUserConfig config = RuntimeConfigFile::ParseConfig(input, "migrated.toml");
+        if (!Require(config.forceAspect == std::optional<bool>{true} &&
+                         config.widescreen == std::optional<bool>{false} && !config.legacyForceAspect,
+                     "legacy force_16_9 overrode force_aspect")) return 1;
+    }
+    {
+        std::istringstream input("[controller]\nmotion_trick = true\nmotion_trick_sensitivity = 5\n");
+        const RuntimeUserConfig config = RuntimeConfigFile::ParseConfig(input, "motion.toml");
+        if (!Require(config.motionTrick == std::optional<bool>{true} &&
+                         config.motionTrickSensitivity == std::optional<int32_t>{5},
+                     "shake to trick settings were not loaded")) return 1;
+    }
+    {
+        std::istringstream input("[controller]\nmotion_trick_sensitivity = 9\n");
+        const RuntimeUserConfig config = RuntimeConfigFile::ParseConfig(input, "motion-range.toml");
+        if (!Require(!config.motionTrick && !config.motionTrickSensitivity,
+                     "out of range shake to trick sensitivity was accepted")) return 1;
+    }
+    {
+        std::istringstream input("[controller]\nsteam_input_override = false\nsteam_input_app_id = 1234\n");
+        const RuntimeUserConfig config = RuntimeConfigFile::ParseConfig(input, "steam.toml");
+        if (!Require(config.steamInputOverride == std::optional<bool>{false} &&
+                         config.steamInputAppId == std::optional<uint32_t>{1234},
+                     "Steam Input settings were not loaded")) return 1;
+    }
+    {
+        std::istringstream input("[controller]\nsteam_input_app_id = 0\n");
+        const RuntimeUserConfig config = RuntimeConfigFile::ParseConfig(input, "steam-zero.toml");
+        if (!Require(!config.steamInputAppId, "zero Steam Input app id was accepted")) return 1;
+    }
     if (!SetsFps("[video]\nshow_fps = false\n", "bare key was not replaced")) return 1;
     if (!SetsFps("[video]\n\"show_fps\" = false\n", "basic-quoted key was not replaced")) return 1;
     if (!SetsFps("[video]\n'show_fps'=false\n", "literal-quoted key was not replaced")) return 1;
@@ -101,6 +140,22 @@ int main() {
     if (!Require(!RuntimeConfigFile::UpdateSettingText("controller = \"custom\"\n", "controller.wii_accel_offsets",
                                                        "x", "0.5"),
                  "a scalar was replaced by a table")) return 1;
+    {
+        const auto removed = RuntimeConfigFile::RemoveTableText(
+            "[controller]\nrumble = true\n\n[controller.wii1]\na = \"south\" # mine\n\n[controller.wii2]\na = \"east\"\n",
+            "controller.wii1");
+        const auto document = removed ? std::optional(toml::parse_str<toml::ordered_type_config>(*removed)) : std::nullopt;
+        if (!Require(document && !document->at("controller").contains("wii1") &&
+                         document->at("controller").at("wii2").at("a").as_string() == "east" &&
+                         document->at("controller").at("rumble").as_boolean(),
+                     "a row table was not removed on its own")) return 1;
+        const std::string original = "[controller]\nrumble = true\n";
+        const auto unchanged = RuntimeConfigFile::RemoveTableText(original, "controller.wii3");
+        if (!Require(unchanged && toml::parse_str<toml::ordered_type_config>(*unchanged).at("controller").at("rumble").as_boolean(),
+                     "a missing row table changed the document")) return 1;
+        if (!Require(!RuntimeConfigFile::RemoveTableText("[controller\n", "controller.wii1"),
+                     "an unparseable document was rewritten")) return 1;
+    }
     {
         const auto document = Update("[video.advanced]\nfoo = 1\n", "video", "show_fps", "true");
         if (!Require(document && document->at("video").at("show_fps").as_boolean() &&

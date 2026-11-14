@@ -307,9 +307,6 @@ void RegisterStaticIndirectDispatchTable(const StaticIndirectDispatchTable* tabl
         std::abort();
     }
     registered = table;
-    // Mirror into the header-visible atomic under the same lock, so the
-    // inlined miss path and this owning static can never disagree.
-    g_publishedStaticIndirectDispatchTable.store(table, std::memory_order_release);
 }
 
 void RegisterBulkTranslatedFunctions(const BulkTranslatedFunctionRecord* records, size_t count) {
@@ -398,6 +395,7 @@ void TranslatedFunctionRegistry::Finalize() {
             auto& addressEntries = AddressEntries();
             addressEntries.clear();
             addressEntries.rehash(0);
+            BuildRawDispatchTableLocked();
             RegistryFrozen().store(true, std::memory_order_release);
             lookupPublished_.store(true, std::memory_order_release);
         }
@@ -426,20 +424,10 @@ const TranslatedFunctionInfo* TranslatedFunctionRegistry::FindByAddressPtrSlow(u
     return nullptr;
 }
 
-GuestFunctions::Entry GuestFunctions::BaseTranslation(uint32_t address) {
-    std::unique_lock<std::mutex> lock(RegistryMutex(), std::defer_lock);
-    if (!RegistryFrozen().load(std::memory_order_acquire)) {
-        lock.lock();
-    }
-    for (const auto& entry : Registry()) {
-        if (entry.address == address && entry.kind == FunctionKind::BaseTranslated && entry.rawCpuInvoker) {
-            return entry.rawCpuInvoker;
-        }
-    }
-    if (lock.owns_lock()) {
-        lock.unlock();
-    }
-    RT_LOG(RT_TAG_RUNTIME) << "ERROR: no base translation registered at 0x" << std::hex << address << std::dec
+namespace {
+
+[[noreturn]] void ReportMissingGuestFunction(uint32_t address) {
+    RT_LOG(RT_TAG_RUNTIME) << "ERROR: no translation registered at 0x" << std::hex << address << std::dec
                            << std::endl;
     std::ostringstream message;
     message << "The runtime calls the translated function at guest address 0x" << std::hex << address
@@ -451,19 +439,76 @@ GuestFunctions::Entry GuestFunctions::BaseTranslation(uint32_t address) {
     std::exit(EXIT_FAILURE);
 }
 
-const RawDispatchRecord* TranslatedFunctionRegistry::FindRawByAddressPtrSlow(uint32_t address) {
-    if (!RegistryFrozen().load(std::memory_order_acquire)) {
-        return nullptr;
+} // namespace
+
+GuestFunctions::Entry GuestFunctions::BaseTranslation(uint32_t address) {
+    {
+        std::unique_lock<std::mutex> lock(RegistryMutex(), std::defer_lock);
+        if (!RegistryFrozen().load(std::memory_order_acquire)) {
+            lock.lock();
+        }
+        for (const auto& entry : Registry()) {
+            if (entry.address == address && entry.kind == FunctionKind::BaseTranslated && entry.rawCpuInvoker) {
+                return entry.rawCpuInvoker;
+            }
+        }
     }
-    if (const auto* generated = FindStaticIndirectDispatchEntry(GeneratedIndirectDispatchTable(), address)) {
-        return generated;
+    ReportMissingGuestFunction(address);
+}
+
+GuestFunctions::Entry GuestFunctions::NextTranslation(uint32_t address) {
+    {
+        std::unique_lock<std::mutex> lock(RegistryMutex(), std::defer_lock);
+        if (!RegistryFrozen().load(std::memory_order_acquire)) {
+            lock.lock();
+        }
+        const TranslatedFunctionInfo* best = nullptr;
+        for (const auto& entry : Registry()) {
+            if (entry.address == address && entry.kind != FunctionKind::Native && entry.rawCpuInvoker &&
+                (!best || IsBetterCandidate(entry, *best))) {
+                best = &entry;
+            }
+        }
+        if (best) {
+            return best->rawCpuInvoker;
+        }
     }
-    const auto& entries = DynamicRawDispatchEntries();
-    const auto it = std::lower_bound(entries.begin(), entries.end(), address,
-        [](const RawDispatchRecord& entry, uint32_t target) {
-            return entry.address < target;
-        });
-    return it != entries.end() && it->address == address ? &*it : nullptr;
+    ReportMissingGuestFunction(address);
+}
+
+void TranslatedFunctionRegistry::BuildRawDispatchTableLocked() {
+    const auto* generated = GeneratedIndirectDispatchTable();
+    const auto& dynamic = DynamicRawDispatchEntries();
+    const size_t generatedCount = generated != nullptr ? generated->entryCount : 0;
+    uint32_t bits = 10;
+    while ((size_t{1} << bits) < (generatedCount + dynamic.size()) * 2) {
+        ++bits;
+    }
+    static std::vector<RawDispatchHashSlot> slots;
+    static RawDispatchHashTable table;
+    slots.assign(size_t{1} << bits, RawDispatchHashSlot{0, nullptr});
+    table = {slots.data(), (1u << bits) - 1u, 32u - bits};
+    // The first record put at an address wins: the generated table, then the dynamic records in
+    // address order, the precedence the sorted lookups gave.
+    const auto put = [](const RawDispatchRecord& record) {
+        for (uint32_t index = RawDispatchHashIndex(table, record.address);; index = (index + 1) & table.mask) {
+            RawDispatchHashSlot& slot = slots[index];
+            if (slot.record == nullptr) {
+                slot = {record.address, &record};
+                return;
+            }
+            if (slot.address == record.address) {
+                return;
+            }
+        }
+    };
+    for (size_t i = 0; i < generatedCount; ++i) {
+        put(generated->entries[i]);
+    }
+    for (const auto& record : dynamic) {
+        put(record);
+    }
+    rawDispatchTable_.store(&table, std::memory_order_release);
 }
 
 std::optional<TranslatedFunctionInfo> FindTranslatedFunctionByHostAddress(uintptr_t hostAddr) {

@@ -41,6 +41,7 @@
 #include <mmsystem.h>
 #include <dbghelp.h>
 #else
+#include <fcntl.h>
 #include <signal.h>
 #if defined(__x86_64__)
 // Only the x86 POSIX fault path inspects ucontext_t to recover the page-fault
@@ -68,6 +69,7 @@
 #include "aurora_events.h"
 #include "wiimote_host.h"
 #include "discord_presence.h"
+#include "steam_input_layout.h"
 #include "fiber_manager.h"
 #include "gx_worker.h"
 #include "hle_stubs.h"
@@ -337,6 +339,9 @@ bool InstallTranscriptPipe(int& outReadFd, int& outWriteFd, int targetFd) {
     if (::pipe(pipeFds) != 0) {
         return false;
     }
+    // Spawned helpers must not keep the transcript open; its reader waits for EOF on shutdown.
+    ::fcntl(pipeFds[0], F_SETFD, FD_CLOEXEC);
+    ::fcntl(pipeFds[1], F_SETFD, FD_CLOEXEC);
 #endif
 
     outReadFd = pipeFds[0];
@@ -1098,6 +1103,7 @@ LONG ReportFatalSehAndExit(EXCEPTION_POINTERS* info) {
                      << " at host address 0x" << record->ExceptionInformation[1];
     }
     popupDetails << ".\n\nThe process transcript and crash log contain the full CPU and stack diagnostics.";
+    SteamInputLayout::Release();
     ShowRuntimeFatalPopup("a native crash occurred", popupDetails.str());
     DumpHostStackTrace();
 
@@ -1198,6 +1204,7 @@ void PosixMemoryFaultHandler(int sig, siginfo_t* info, void* ucontextVoid) {
     }
     popupDetails << ".\n\nThe process transcript and crash log contain the full CPU and stack "
                     "diagnostics.";
+    SteamInputLayout::Release();
     ShowRuntimeFatalPopup("a native crash occurred", popupDetails.str());
     DumpHostStackTrace();
     WriteFatalLogImpl(sig == SIGBUS ? "sigbus" : "sigsegv");
@@ -1231,6 +1238,7 @@ void AbortSignalHandler(int signum) {
     // abort() bypasses atexit, so the guest-memory fault summary has to be
     // emitted here too. It is idempotent, so a later AtExitHandler is a no-op.
     GuestFlat::LogFaultSummary();
+    SteamInputLayout::Release();
 
     ShowRuntimeFatalPopup("a fatal internal error occurred",
                           "The process called abort while running the game or Aurora renderer.\n\n"
@@ -1266,6 +1274,7 @@ void SetRuntimeExitCode(int code) {
 
 // Global handler called via atexit() to flush buffers before any exit
 static void AtExitHandler() {
+    SteamInputLayout::Release();
     // End-of-run guest memory report. This runs before the fatal-report check
     // below because the counters describe the whole session and are just as
     // interesting after a crash as after a clean exit.
@@ -1290,6 +1299,7 @@ static void AtExitHandler() {
 
 // Global terminate handler for uncaught exceptions
 static void TerminateHandler() {
+    SteamInputLayout::Release();
     // Skip detailed dump if already reported
     if (g_fatalErrorReported.load(std::memory_order_acquire)) {
         std::fflush(stderr);
@@ -1397,9 +1407,10 @@ int RuntimeMain(int argc, char** argv) {
         auroraConfig.cachePath = auroraCachePath.c_str();
         auroraConfig.logCallback = &RuntimeAuroraLogCallback;
         auroraConfig.logLevel = LOG_DEBUG;
+        RuntimeConfigFile::MigrateLegacyForceAspect();
         const bool configWidescreen = RuntimeConfigFile::WidescreenEnabled(true);
-        const bool forceAspect169 = RuntimeConfigFile::ForceAspect169Enabled();
-        auroraConfig.windowWidth = (configWidescreen || forceAspect169) ? 854 : 640;
+        const bool forceAspect = RuntimeConfigFile::ForceAspectEnabled();
+        auroraConfig.windowWidth = configWidescreen ? 854 : 640;
         auroraConfig.windowHeight = 480;
         auroraConfig.windowWidth = RuntimeConfigFile::WindowWidth(auroraConfig.windowWidth);
         auroraConfig.windowHeight = RuntimeConfigFile::WindowHeight(auroraConfig.windowHeight);
@@ -1418,7 +1429,7 @@ int RuntimeMain(int argc, char** argv) {
         auroraConfig.vsync = RuntimeConfigFile::Vsync();
         auroraConfig.desiredBackend = BACKEND_AUTO;
         const float resolutionMultiplier = RuntimeConfigFile::ResolutionMultiplier(1.0f);
-        ConfigureMkwDynamicAspect(configWidescreen, forceAspect169,
+        ConfigureMkwDynamicAspect(configWidescreen, forceAspect,
                                   auroraConfig.windowWidth, auroraConfig.windowHeight);
         VISetFrameBufferScale(resolutionMultiplier);
         // One table for both directions. RuntimeConfigFile::IsSupportedGraphicsApi
@@ -1485,19 +1496,23 @@ int RuntimeMain(int argc, char** argv) {
         UpdateMkwDynamicAspectSurface(auroraInfo.windowSize.native_fb_width,
                                       auroraInfo.windowSize.native_fb_height);
         settings_overlay::InitializeRuntimeSettings();
+        if (!g_headless) {
+            SteamInputLayout::Initialize(RuntimeConfigFile::SteamInputOverrideEnabled(),
+                                         RuntimeConfigFile::SteamInputAppId());
+        }
         if (BootRace::Requested()) {
             aurora_set_skip_unready_pipelines(false);
         }
         RT_LOG(RT_TAG_CONFIG) << "video.widescreen=" << (configWidescreen ? "true" : "false")
-                  << " force_16_9=" << (forceAspect169 ? "true" : "false")
-                  << " SCGetAspectRatio=" << (configWidescreen || forceAspect169 ? 1 : 0)
+                  << " force_aspect=" << (forceAspect ? "true" : "false")
+                  << " SCGetAspectRatio=" << (configWidescreen ? 1 : 0)
                   << " resolutionMultiplier=" << resolutionMultiplier
                   << " window=" << auroraInfo.windowSize.width << "x" << auroraInfo.windowSize.height
                   << " native=" << auroraInfo.windowSize.native_fb_width << "x"
                   << auroraInfo.windowSize.native_fb_height
-                  << " viewportPolicy=" << (forceAspect169 ? "16:9" : (configWidescreen ? "stretch" : "fit"))
+                  << " viewportPolicy=" << (forceAspect ? (configWidescreen ? "16:9" : "fit") : "stretch")
                   << " presentAspect="
-                  << (forceAspect169 ? "16:9" : (configWidescreen ? "surface (dynamic EGG canvas)" : "4:3"))
+                  << (forceAspect ? (configWidescreen ? "16:9" : "4:3") : "surface (dynamic EGG canvas)")
                   << std::endl;
         g_auroraInitialized.store(true, std::memory_order_release);
         GxWorker::SetWaitCallback(ServiceGuestTimingDuringAuroraFrameWait);
@@ -1530,6 +1545,7 @@ int RuntimeMain(int argc, char** argv) {
         Fiber::GuestFiberManager::Shutdown();
         WindowPlacementPersistence::Flush(true);
         Wiimote::Shutdown();
+        SteamInputLayout::Release();
         GxWorker::Stop();
         aurora_shutdown();
         DiscordPresence::Shutdown();
@@ -1544,6 +1560,7 @@ int RuntimeMain(int argc, char** argv) {
                 << " len=0x" << ex.length()
                 << std::dec << std::nouppercase
                 << " reason=" << ex.reason();
+        SteamInputLayout::Release();
         ShowRuntimeFatalPopup("a guest memory access was out of bounds", details.str());
         WriteFatalLogImpl("access_violation", details.str());
         SetRuntimeExitCodeImpl(1);
@@ -1558,6 +1575,7 @@ int RuntimeMain(int argc, char** argv) {
     } catch (const std::exception& ex) {
         std::cerr << "Runtime error: " << ex.what() << std::endl;
         SystemBridge::DumpCpuState(TryGetCpuContext());
+        SteamInputLayout::Release();
         ShowRuntimeFatalPopup("a runtime exception occurred", ex.what());
         WriteFatalLogImpl("exception");
         SetRuntimeExitCodeImpl(1);

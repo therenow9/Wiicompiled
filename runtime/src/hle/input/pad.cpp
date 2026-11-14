@@ -3,6 +3,7 @@
 #include "hle/controller_status_contract.h"
 #include "input_bindings.h"
 #include "wiimote_host.h"
+#include "motion_trick.h"
 
 #include <algorithm>
 #include <atomic>
@@ -118,6 +119,7 @@ extern "C" uint32_t PAD__Read_HLE(uint32_t statusPtr)
 
     FillTriggersHeldByButtons(statuses);
     InputBindings::Apply(statuses);
+    MotionTrick::Apply(statuses);
 
     try {
         for (uint32_t i = 0; i < PAD_CHANMAX; ++i) {
